@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AI SKU Auditor</title>
+<script src="https://live.zwidgets.com/js-sdk/1.0.5/ZohoEmbededAppSDK.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #f4f6f9; color: #1a1a2e; padding: 20px; font-size: 13px;
+  }
+  h2 { font-size: 16px; font-weight: 700; color: #1a1a2e; margin-bottom: 16px; }
+
+  .final-call { border-radius: 10px; padding: 14px 18px; margin-bottom: 20px; display: flex; align-items: flex-start; gap: 12px; }
+  .final-call.clear { background: #d1fae5; border-left: 5px solid #10b981; }
+  .final-call.query { background: #fef3c7; border-left: 5px solid #f59e0b; }
+  .final-call.hold  { background: #fee2e2; border-left: 5px solid #ef4444; }
+  .final-call .fc-icon  { font-size: 22px; line-height: 1; }
+  .final-call .fc-body  { flex: 1; }
+  .final-call .fc-title { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .final-call .fc-detail { font-size: 12px; line-height: 1.7; color: #374151; list-style: none; }
+
+  .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 16px 18px; margin-bottom: 20px; }
+  .card h3 { font-size: 13px; font-weight: 700; margin-bottom: 12px; color: #374151; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 2px solid #f3f4f6; padding-bottom: 8px; }
+
+  .table-wrap { overflow-x: auto; width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; table-layout: fixed; }
+
+  thead th { background: #1a1a2e; color: #fff; padding: 9px 10px; text-align: left; font-weight: 600;  }
+  table th:nth-child(1) { width: 35px; }   /* # */
+  table th:nth-child(2) { width: 160px; }  /* ZQ SKU */
+  table th:nth-child(3) { width: 55px; }   /* SO Qty */
+  table th:nth-child(4) { width: 55px; }   /* ZQ Qty */
+  table th:nth-child(5) { width: 90px; }   /* ZQ-SO */
+  table th:nth-child(6) { width: 55px; }   /* PO Qty */
+  table th:nth-child(7) { width: 90px; }   /* ZQ-PO */
+  table th:nth-child(8) { width: 90px; }   /* SO-PO */
+  table th:nth-child(9) { width: auto; }   /* Notes — takes remaining space */
+  tbody tr:hover { background: #eff6ff; }
+  tbody td {
+    padding: 8px 10px;
+    border-bottom: 1px solid #f3f4f6;
+    vertical-align: top;
+    line-height: 1.4;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+  .sku        { font-family: monospace; font-size: 11px; color: #4b5563; }
+  .notes-cell {
+    font-size: 11px;
+    color: #6b7280;
+    word-wrap: break-word;
+    white-space: normal;
+    min-width: 150px;
+}
+  .qty        { text-align: center; font-weight: 600; }
+  .qty-diff   { color: #ef4444; }
+
+  .pill         { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .pill-match   { background: #d1fae5; color: #065f46; }
+  .pill-review  { background: #fef3c7; color: #92400e; }
+  .pill-miss    { background: #fee2e2; color: #991b1b; }
+  .pill-na      { background: #f3f4f6; color: #9ca3af; }
+
+  .summary-section { margin-bottom: 12px; }
+  .summary-section:last-child { margin-bottom: 0; }
+  .summary-label { font-weight: 700; font-size: 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+  .summary-list { list-style: none; padding-left: 4px; }
+  .summary-list li { padding: 5px 0 5px 12px; border-left: 3px solid #e5e7eb; margin-bottom: 4px; font-size: 12px; color: #374151; line-height: 1.5; }
+  .summary-list li.red   { border-left-color: #ef4444; }
+  .summary-list li.amber { border-left-color: #f59e0b; }
+  .tag { display: inline-block; background: #fee2e2; color: #991b1b; border-radius: 4px; padding: 3px 8px; font-size: 11px; margin: 3px; font-family: monospace; }
+
+  .state-box { text-align: center; padding: 60px 20px; color: #9ca3af; font-size: 13px; }
+  .spinner-wrap {
+    position: relative;
+    width: 80px;
+    height: 80px;
+    margin: 0 auto 20px;
+  }
+  .spinner {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    border: 7px solid transparent;
+    border-top-color: #6366f1;
+    border-right-color: #10b981;
+    border-bottom-color: #f59e0b;
+    border-left-color: #ef4444;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner-timer {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 14px;
+    font-weight: 700;
+    color: #1a1a2e;
+    font-family: monospace;
+    pointer-events: none;
+  }
+  .phase-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 10px;
+  }
+  .phase-list {
+    list-style: none;
+    padding: 0;
+    margin: 16px auto 0;
+    max-width: 320px;
+    text-align: left;
+  }
+  .phase-list li {
+    font-size: 12px;
+    padding: 5px 0 5px 28px;
+    position: relative;
+    color: #9ca3af;
+    line-height: 1.4;
+  }
+  .phase-list li.done {
+    color: #065f46;
+  }
+  .phase-list li.active {
+    color: #1a1a2e;
+    font-weight: 600;
+  }
+  .phase-list li:before {
+    content: "○";
+    position: absolute;
+    left: 6px;
+    font-size: 11px;
+  }
+  .phase-list li.done:before {
+    content: "✓";
+    color: #10b981;
+  }
+  .phase-list li.active:before {
+    content: "●";
+    color: #6366f1;
+  }
+
+  .error-box { background: #fee2e2; border: 1px solid #fca5a5; border-radius: 10px; padding: 16px 20px; color: #991b1b; font-size: 13px; line-height: 1.6; }
+  .error-box strong { display: block; margin-bottom: 4px; }
+
+
+  /* ── EXISTING REPORT PROMPT ── */
+  .report-prompt {
+    background: #fff; border-radius: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    padding: 20px 24px; margin-bottom: 20px;
+    border-left: 5px solid #3b82f6;
+  }
+  .report-prompt h3 { font-size: 14px; font-weight: 700; color: #1e40af; margin-bottom: 6px; }
+  .report-prompt p  { font-size: 12px; color: #374151; margin-bottom: 16px; line-height: 1.6; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; border: none; border-radius: 8px; padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary   { background: #1a1a2e; color: #fff; }
+  .btn-secondary { background: #e5e7eb; color: #374151; }
+  .btn-danger    { background: #fee2e2; color: #991b1b; }
+
+  /* ── SUCCESS BANNER ── */
+  .saved-banner {
+    background: #d1fae5; border: 1px solid #6ee7b7;
+    border-radius: 8px; padding: 10px 14px;
+    font-size: 12px; color: #065f46;
+    margin-bottom: 16px; display: flex;
+    align-items: center; gap: 8px;
+  }
+</style>
+</head>
+<body>
+
+<h2>&#128269; PO Processing - Document Comparison</h2>
+<div id="app">
+  <div class="state-box">
+    <div class="spinner-wrap">
+      <div class="spinner"></div>
+      <div class="spinner-timer" id="spinTimer">0s</div>
+    </div>
+    <div class="phase-label">Initialising&#8230;</div>
+  </div>
+</div>
+
+<script>
+// ── CONFIG ────────────────────────────────────────────────────
+var BASE_URL   = "https://sku-auditor-162333423192.us-central1.run.app";
+var START_URL  = BASE_URL + "/analyze-quote";
+var STATUS_URL = BASE_URL + "/job-status/";
+var CHECK_URL  = BASE_URL + "/check-report/";
+var MAX_POLL   = 120;
+var POLL_MS    = 3000;
+var pollTimer  = null;
+var currentQuoteId = null;
+var currentJobId = null;
+// ── UI HELPERS ────────────────────────────────────────────────
+// Phase definitions — order determines progress list
+var PHASES = [
+  "Fetching quote from Zoho...",
+  "Downloading PDF attachments...",
+  "Extracting line items with Gemini AI...",
+  "Comparing documents with Claude AI...",
+  "Generating PDF report...",
+  "Attaching report to Zoho quote..."
+];
+
+var _timerInterval = null;
+var _loadingStart  = null;
+
+function showLoading(phase) {
+  // Start timer if not already running
+  if (!_loadingStart) {
+    _loadingStart = Date.now();
+  }
+
+  // Build phase list
+  var phaseHTML = '<ul class="phase-list">';
+  var activeFound = false;
+  for (var i = 0; i < PHASES.length; i++) {
+    var isActive = (PHASES[i] === phase);
+    var isDone   = !activeFound && !isActive && phase !== null;
+    if (isActive) activeFound = true;
+    var cls = isActive ? "active" : (isDone ? "done" : "");
+    phaseHTML += '<li class="' + cls + '">' + PHASES[i] + '</li>';
+  }
+  phaseHTML += '</ul>';
+
+  // Find elapsed if timer already running
+  var elapsed = _loadingStart ? Math.floor((Date.now() - _loadingStart) / 1000) : 0;
+
+  document.getElementById("app").innerHTML =
+    '<div class="state-box">'
+    + '<div class="spinner-wrap">'
+    + '<div class="spinner"></div>'
+    + '<div class="spinner-timer" id="spinTimer">' + elapsed + 's</div>'
+    + '</div>'
+    + '<div class="phase-label">' + (phase || "Processing...") + '</div>'
+    + phaseHTML
+    + '</div>';
+
+  // Start or keep timer running
+  if (_timerInterval) clearInterval(_timerInterval);
+  _timerInterval = setInterval(function() {
+    var el = document.getElementById("spinTimer");
+    if (el && _loadingStart) {
+      el.textContent = Math.floor((Date.now() - _loadingStart) / 1000) + "s";
+    }
+  }, 1000);
+}
+
+function stopTimer() {
+  if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+  _loadingStart = null;
+}
+
+function showError(msg) {
+  // Detect attachment-specific errors and show a friendlier message
+  var isAttachmentError = msg && (
+    msg.indexOf("missing from this quote") !== -1 ||
+    msg.indexOf("PDF attachments are missing") !== -1 ||
+    msg.indexOf("Please attach") !== -1 ||
+    msg.indexOf("re-attach") !== -1
+  );
+
+  if (isAttachmentError) {
+    var lines    = msg.split("\n").filter(function(l) { return l.trim(); });
+    var headline = lines[0] || "Missing attachments";
+    var items    = lines.slice(1).map(function(l) {
+      return "<li>" + l.replace(/^[\s\-]+/, "") + "</li>";
+    }).join("");
+    document.getElementById("app").innerHTML =
+      '<div class="error-box" style="border-color:#f59e0b;background:#fffbeb;color:#92400e">'
+      + '<strong style="font-size:14px">&#128206; Attachments Missing</strong>'
+      + '<p style="margin-top:6px;margin-bottom:10px">' + headline + '</p>'
+      + (items ? '<ul style="padding-left:16px;line-height:1.8">' + items + '</ul>' : '')
+      + '<p style="margin-top:10px;font-size:11px;color:#b45309">'
+      + 'Go to the <strong>Basic Information</strong> section of this quote, upload the required PDFs, then click Compare again.'
+      + '</p></div>';
+    return;
+  }
+
+  stopTimer();
+  document.getElementById("app").innerHTML =
+    '<div class="error-box"><strong>&#9888; Error</strong>'
+    + '<p style="margin-top:4px">' + msg + '</p></div>';
+}
+
+// ── PARSE ZOHO HTTP RESPONSE ──────────────────────────────────
+function parseResponse(response) {
+  var raw = typeof response === "string" ? response : JSON.stringify(response);
+  try {
+    var outer = JSON.parse(raw);
+    if (outer && typeof outer.data    === "string") { raw = outer.data; }
+    if (outer && typeof outer.details === "string") { raw = outer.details; }
+  } catch(e) {}
+  var clean = raw.replace(/```json/g, "").replace(/```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+// ── STEP 0: CHECK FOR EXISTING REPORT ────────────────────────
+function checkExistingReport(quoteId) {
+  showLoading("Checking for existing report&#8230;", 0);
+
+  ZOHO.CRM.HTTP.get({
+    url: CHECK_URL + quoteId,
+    headers: { "Content-Type": "application/json" }
+  }).then(function(response) {
+    try {
+      var parsed = parseResponse(response);
+
+      if (parsed.error) {
+        // Server returned an error — show it, don't run analysis
+        showError("Check report failed: " + parsed.error
+          + "<br><br><button class='btn btn-secondary' onclick='runAnalysis(\""
+          + quoteId + "\")'>&#128260; Run Anyway</button>");
+        return;
+      }
+
+      if (parsed.exists) {
+        showExistingReportPrompt(quoteId, parsed);
+      } else {
+        runAnalysis(quoteId);
+      }
+
+    } catch(e) {
+      // Parse error — show it, don't run analysis
+      showError("Failed to parse check-report response: " + e.message
+        + "<br><pre style='font-size:11px'>" + String(response).substring(0, 300) + "</pre>"
+        + "<br><button class='btn btn-secondary' onclick='runAnalysis(\""
+        + quoteId + "\")'>&#128260; Run Anyway</button>");
+    }
+
+  }).catch(function(error) {
+    // Network error — show it, don't run analysis
+    showError("Check report network error: " + JSON.stringify(error)
+      + "<br><br><button class='btn btn-secondary' onclick='runAnalysis(\""
+      + quoteId + "\")'>&#128260; Run Anyway</button>");
+  });
+}
+
+// ── SHOW EXISTING REPORT OPTIONS ─────────────────────────────
+function showExistingReportPrompt(quoteId, reportInfo) {
+  var createdAt = reportInfo.created_time
+    ? ' Generated: ' + reportInfo.created_time
+    : "";
+
+  document.getElementById("app").innerHTML =
+    '<div class="report-prompt">'
+    + '<h3>&#128196; Existing Report Found</h3>'
+    + '<p>A procurement analysis report already exists for this quote.' + createdAt + '<br><br>'
+    + '&#128204; To view it, close this popup and open the <strong>Attachments</strong> '
+    + 'section in the left panel of this quote record.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-secondary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Fresh Comparison</button>'
+    + '</div></div>';
+}
+// ── OPEN EXISTING REPORT (inline in widget) ───────────────────
+function openExistingReport(quoteId, attachmentId) {
+  // Open directly in Zoho — no Cloud Run call needed
+  var zohoAttachmentUrl = "https://crm.zoho.com/crm/org/Quotes/"
+    + quoteId + "/Attachments/" + attachmentId;
+  window.open(zohoAttachmentUrl, "_blank");
+
+  // Show run fresh button
+  document.getElementById("app").innerHTML =
+    '<div class="report-prompt">'
+    + '<h3>&#128196; Report Opened</h3>'
+    + '<p>The existing report has been opened in a new tab.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-secondary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Fresh Comparison</button>'
+    + '</div></div>';
+}
+
+// ── STEP 1: START ANALYSIS JOB ───────────────────────────────
+function runAnalysis(quoteId) {
+  if (pollTimer) { clearTimeout(pollTimer); }
+  jobStartTime   = Date.now();
+  _loadingStart  = Date.now();
+  if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+  showLoading("Fetching quote from Zoho...");
+
+  ZOHO.CRM.HTTP.post({
+    url: START_URL,
+    body: JSON.stringify({ quote_id: quoteId }),
+    headers: { "Content-Type": "application/json" }
+  }).then(function(response) {
+    try {
+      var parsed = parseResponse(response);
+      if (parsed.job_id) {
+        pollJobStatus(parsed.job_id, quoteId, 1);
+      } else if (parsed.matching_table) {
+        render(parsed);
+      } else {
+        showError("Unexpected response.<br><pre style='font-size:11px'>"
+          + JSON.stringify(parsed, null, 2).substring(0, 400) + "</pre>");
+      }
+    } catch(e) {
+      showError("Failed to start job: " + e.message
+        + "<br><pre style='font-size:11px'>" + String(response).substring(0, 400) + "</pre>");
+    }
+  }).catch(function(error) {
+    showError("API call failed: " + JSON.stringify(error));
+  });
+}
+
+// ── STEP 2: POLL FOR RESULT ───────────────────────────────────
+function pollJobStatus(jobId, quoteId, attempt) {
+  currentJobId = jobId;
+  if (attempt > MAX_POLL) {
+    showError("Timed out after " + (MAX_POLL * POLL_MS / 1000) + "s. Please try again.");
+    return;
+  }
+  // Phase shown from server response — showLoading called after poll response
+
+  ZOHO.CRM.HTTP.get({
+    url: STATUS_URL + jobId,
+    headers: { "Content-Type": "application/json" }
+  }).then(function(response) {
+    try {
+      var parsed = parseResponse(response);
+      if (parsed.status === "done") {
+        render(parsed.result, parsed.generated_at,parsed.quote_ref);
+      } else if (parsed.status === "error") {
+        showError("Server error: " + (parsed.error || "Unknown error"));
+      } else {
+        // Show current phase from server
+        var serverPhase = parsed.phase || "Processing...";
+        showLoading(serverPhase);
+        pollTimer = setTimeout(function() {
+          pollJobStatus(jobId, quoteId, attempt + 1);
+        }, POLL_MS);
+      }
+    } catch(e) {
+      pollTimer = setTimeout(function() {
+        pollJobStatus(jobId, quoteId, attempt + 1);
+      }, POLL_MS);
+    }
+  }).catch(function() {
+    pollTimer = setTimeout(function() {
+      pollJobStatus(jobId, quoteId, attempt + 1);
+    }, POLL_MS);
+  });
+}
+
+// ── RENDER HELPERS ────────────────────────────────────────────
+function statusPill(status) {
+  if (!status || status === "-") return '<span class="pill pill-na">N/A</span>';
+  var s = status.toLowerCase();
+  if (s === "match")        return '<span class="pill pill-match">&#10003; Match</span>';
+  if (s === "needs review") return '<span class="pill pill-review">&#9888; Review</span>';
+  if (s === "mismatch")     return '<span class="pill pill-miss">&#128308; Mismatch</span>';
+  return '<span class="pill pill-na">' + status + "</span>";
+}
+
+function finalCallBanner(data) {
+  var fc  = (data.final_call || "").toUpperCase();
+  var cls = "query", icon = "!";
+  if (fc.indexOf("CLEAR") !== -1) { cls = "clear"; icon = "&#10003;"; }
+  if (fc.indexOf("HOLD")  !== -1) { cls = "hold";  icon = "&#10007;"; }
+  var details = (data.final_call_detail || []).map(function(d) { return "<li>&#8226; " + d + "</li>"; }).join("");
+  return '<div class="final-call ' + cls + '">'
+    + '<div class="fc-icon">' + icon + "</div>"
+    + '<div class="fc-body"><div class="fc-title">' + (data.final_call || "") + "</div>"
+    + (details ? '<ul class="fc-detail">' + details + "</ul>" : "")
+    + "</div></div>";
+}
+
+function matchingTable(rows) {
+  if (!rows || rows.length === 0) return '<p style="color:#9ca3af;font-size:12px">No items found.</p>';
+  var headers = ["#","ZQ SKU","SO Qty","ZQ Qty","ZQ&#8596;SO","PO Qty","ZQ&#8596;PO","SO&#8596;PO","Notes"]
+    .map(function(h) { return "<th>" + h + "</th>"; }).join("");
+  var bodyRows = rows.map(function(r) {
+    var qtyMismatch = r.po_qty && r.zq_qty && String(r.po_qty) !== String(r.zq_qty);
+    return "<tr>"
+      + '<td class="qty">'        + (r.num    || "")  + "</td>"
+      + '<td class="sku">'        + (r.sku || "-") + "</td>"
+      + '<td class="qty">'        + (r.so_qty || "-") + "</td>"
+      + '<td class="qty">'        + (r.zq_qty || "-") + "</td>"
+      + "<td>"                    + statusPill(r.zq_status) + "</td>"
+      + '<td class="qty'          + (qtyMismatch ? " qty-diff" : "") + '">' + (r.po_qty || "-") + "</td>"
+      + "<td>"                    + statusPill(r.so_status) + "</td>"
+      + "<td>"                    + statusPill(r.po_status) + "</td>"
+      + '<td class="notes-cell">' + (r.notes  || "") + "</td>"
+      + "</tr>";
+  }).join("");
+  return '<div class="table-wrap"><table><thead><tr>' + headers + "</tr></thead><tbody>" + bodyRows + "</tbody></table></div>";
+}
+
+function summarySection(data) {
+  var resolve   = (data.must_resolve    || []).map(function(i) { return '<li class="red">'   + i + "</li>"; }).join("") || "<li>None</li>";
+  var review    = (data.needs_review    || []).map(function(i) { return '<li class="amber">' + i + "</li>"; }).join("") || "<li>None</li>";
+  var unmatched = (data.unmatched_items || []).map(function(i) { return '<span class="tag">' + i + "</span>"; }).join("");
+  return '<div class="summary-section">'
+    + '<div class="summary-label" style="color:#ef4444">&#10007; Must Resolve Before Processing</div>'
+    + '<ul class="summary-list">' + resolve + "</ul></div>"
+    + '<div class="summary-section">'
+    + '<div class="summary-label" style="color:#f59e0b">&#9888; Needs Human Review</div>'
+    + '<ul class="summary-list">' + review + "</ul></div>"
+    + (unmatched ? '<div class="summary-section"><div class="summary-label" style="color:#ef4444">&#10007; Unmatched Items</div><div>' + unmatched + "</div></div>" : "")
+    + '<div class="summary-section" style="margin-top:10px">'
+    + '<div class="summary-label" style="color:#10b981">&#10003; Overall</div>'
+    + '<p style="font-size:12px;color:#374151;line-height:1.6">' + (data.overall_summary || "") + "</p></div>";
+}
+
+function render(data, generatedAt,quoteRef) {
+  stopTimer();
+  var savedBanner = generatedAt
+    ? '<div class="saved-banner">Report saved as PDF attachment'
+      + (quoteRef ? ' &nbsp;|&nbsp; <strong>' + quoteRef + '</strong>' : '')
+      + ' &nbsp;(' + generatedAt + ')'
+      + ' &nbsp;<button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" '
+      + 'onclick="runAnalysis(\'' + currentQuoteId + '\')">&#128260; Run Fresh</button></div>'
+    : "";
+    // Quote reference header
+  var quoteHeader = (quoteRef)
+    ? '<div style="background:#fff;border-radius:8px;padding:10px 16px;'
+      + 'margin-bottom:16px;border:1px solid #e5e7eb;font-size:12px;color:#374151">'
+      + '<span style="font-weight:700;color:#1a1a2e">Quote Reference: </span>'
+      + '<span style="font-family:monospace;color:#6366f1;font-size:13px;font-weight:600">'
+      + (quoteRef || "") + '</span>'
+      + '</div>'
+    : "";
+
+  document.getElementById("app").innerHTML =
+    savedBanner
+    + quoteHeader
+    + finalCallBanner(data)
+    + '<div class="card"><h3>&#128203; Section 1 &#8212; Three-Way Item Matching</h3>'
+    + matchingTable(data.matching_table || []) + "</div>"
+    + '<div class="card"><h3>&#128202; Section 2 &#8212; Summary</h3>'
+    + summarySection(data) + "</div>";
+}
+var jobStartTime = null;
+
+function cancelCurrentJob() {
+  if (!currentJobId) return;
+
+  // Grace period — ignore cancel events in first 10 seconds
+  if (jobStartTime && (Date.now() - jobStartTime) < 10000) {
+    console.log("Cancel ignored — grace period");
+    return;
+  }
+
+  var jobToCancel = currentJobId;
+  currentJobId    = null;
+  jobStartTime    = null;
+
+  ZOHO.CRM.HTTP.post({
+    url: BASE_URL + "/cancel-job/" + jobToCancel,
+    body: "{}",
+    headers: { "Content-Type": "application/json" }
+  });
+  console.log("Cancel sent for: " + jobToCancel);
+}
+
+window.addEventListener("beforeunload", cancelCurrentJob);
+window.addEventListener("pagehide",     cancelCurrentJob);
+// ── BOOT ──────────────────────────────────────────────────────
+ZOHO.embeddedApp.on("PageLoad", function(data) {
+  ZOHO.CRM.UI.Resize({ height: "900", width: "1200" });
+  var quoteId = data.EntityId ? data.EntityId[0] : null;
+  if (!quoteId) {
+    showError("Could not read Quote ID from Zoho record.");
+    return;
+  }
+  currentQuoteId = quoteId;
+
+  // First check if report already exists
+  checkExistingReport(quoteId);
+});
+
+ZOHO.embeddedApp.init();
+</script>
+
+</body>
+</html>
