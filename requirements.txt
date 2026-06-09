@@ -1,8 +1,8 @@
 fastapi
-uvicorn
 requests
 pandas
 python-dotenv
 anthropic
 google-generativeai
-fpdf2
+weasyprint
+python-dotenv
