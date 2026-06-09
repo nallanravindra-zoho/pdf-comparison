@@ -46,6 +46,7 @@ CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SO_PDF_FIELD   = os.environ.get("SO_PDF_FIELD", "SO_PDF")
 PO_PDF_FIELD   = os.environ.get("PO_PDF_FIELD", "PO_PDF")
+ACCESS_TOKEN_URL  = os.environ.get("ACCESS_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
 # ─────────────────────────────────────────────
 # IN-MEMORY STORES
 # ─────────────────────────────────────────────
@@ -83,14 +84,14 @@ def get_access_token():
         print("✅ Using cached access token")
         return _token_cache["token"]
 
-    url = "https://accounts.zoho.com/oauth/v2/token"
     params = {
         "refresh_token": REFRESH_TOKEN,
         "client_id":     CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type":    "refresh_token"
     }
-    r = requests.post(url, params=params, timeout=30)
+    print("GOT ACCES TOKEN URL is :",ACCESS_TOKEN_URL)
+    r = requests.post(ACCESS_TOKEN_URL, params=params, timeout=30)
     token = r.json().get("access_token")
     if not token:
         raise Exception("Failed to get access token: " + str(r.json()))
