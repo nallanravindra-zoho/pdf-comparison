@@ -44,8 +44,8 @@ REFRESH_TOKEN  = os.environ["REFRESH_TOKEN"]
 ZOHO_BASE_URL  = os.environ.get("ZOHO_BASE_URL", "https://www.zohoapis.com")
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-SO_PDF_FIELD   = os.environ.get("SO_PDF_FIELD", "SO_PDF")
-PO_PDF_FIELD   = os.environ.get("PO_PDF_FIELD", "PO_PDF")
+PPO_PDF_FIELD   = os.environ.get("PPO_PDF_FIELD", "PPO_PDF_FIELD")
+VQ_PDF_FIELD   = os.environ.get("VQ_PDF_FIELD", "VQ_PDF")
 ACCESS_TOKEN_URL  = os.environ.get("ACCESS_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
 # ─────────────────────────────────────────────
 # IN-MEMORY STORES
@@ -229,9 +229,22 @@ def format_zoho_quote(quote: dict) -> str:
         sku  = item.get("Product_Name", {}).get("Product_Code", "N/A")
         desc = item.get("Description", "N/A")
         qty  = item.get("Quantity", "N/A")
+        quote_currency  = quote.get("Currency", {})
+        Partner_PO_Currency = quote.get("Partner_PO_Currency", "N/A")
+        Vendor_Quote_Currency  = quote.get("Vendor_Quote_Currency", "N/A")
+        Exchange_Rate= quote.get("Exchange_Rate", "N/A")
+        buy_price_zq=item.get("Buy_Price", "N/A")
+        list_price_zq=item.get("List_Price", "N/A")
+
         lines.append(f"  {i}. SKU         : {sku}")
         lines.append(f"     Description : {desc}")
         lines.append(f"     Quantity    : {qty}")
+        lines.append(f"     Quote_Currency         : {quote_currency}")
+        lines.append(f"     Partner_PO_Currency : {Partner_PO_Currency}")
+        lines.append(f"     Vendor_Quote_Currency    : {Vendor_Quote_Currency}")
+        lines.append(f"     Exchange_Rate    : {Exchange_Rate}")
+        lines.append(f"     buy_price_zq   : {buy_price_zq}")
+        lines.append(f"     list_price_zq    : {list_price_zq}")
         lines.append("")
     return "\n".join(lines)
 
@@ -297,16 +310,16 @@ For each line item return exactly these fields:
 •⁠  ⁠sku        : product code or SKU exactly as written (use null if missing or not present)
 •⁠  ⁠description: full product description exactly as written, no truncation
 •⁠  ⁠quantity   : numeric value only, no units (use null if not present or not readable)
-•⁠  ⁠unit       : unit of measure exactly as written — e.g. "each", "pack", "license", "user", "seat" (use null if not present)
+•⁠  list_unit_price  : numeric value only, no units (use null if not present or not readable)
 
-Do NOT include: prices, totals, taxes, dates, addresses, payment terms, or currency.
+Do NOT include: totals, taxes, dates, addresses, payment terms, or currency.
 
 Return ONLY a valid JSON array. No explanation, no markdown, no backticks.
 
 Example output format:
 [
-  {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, "unit": "each"},
-  {"line_num": 2, "sku": null, "description": "FortiGate 100F Hardware", "quantity": 1, "unit": null}
+  {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, list_unit_price":4500},
+  {"line_num": 2, "sku": null, "description": "FortiGate 100F Hardware", "quantity": 1, list_unit_price":null}
 ]
 """
 
@@ -327,7 +340,7 @@ Example output format:
         # Formatted text — faster for Claude to process than minified JSON
         lines = [f"## {label}"]
         for item in items:
-            lines.append(f"  {item.get('line_num','')}. SKU: {item.get('sku','N/A')} | Desc: {item.get('description','N/A')} | Qty: {item.get('quantity','N/A')}")
+            lines.append(f"  {item.get('line_num','')}. SKU: {item.get('sku','N/A')} | Desc: {item.get('description','N/A')} | Qty: {item.get('quantity','N/A')} | list_unit_price: {item.get('list_unit_price','N/A')}")
         return "\n".join(lines)
 
     except json.JSONDecodeError as e:
@@ -344,10 +357,10 @@ You are a procurement document analyst for Cyberknight Technologies, a cybersecu
 Three sources of data are provided:
 •⁠  ⁠Zoho Quote (ZQ) — the internal quote record from Cyberknight's CRM (text format)
 •⁠  ⁠Vendor Quote (VQ) — what Cyberknight is BUYING from the vendor (JSON extracted line items)
-•⁠  ⁠Partner PO (PO) — what the partner is BUYING from Cyberknight (JSON extracted line items)
+•⁠  ⁠Partner PO — what the partner is BUYING from Cyberknight (JSON extracted line items)
 
-Your job is to compare ALL THREE for SKU code + product description + quantity alignment.
-Prices, dates, currencies, payment terms, reference numbers, and addresses WILL differ — do not flag those.
+Your job is to compare ALL THREE for SKU code + product description + quantity alignment, AND to validate pricing.
+Reference numbers, addresses, and payment terms WILL differ — do not flag those.
 
 ---
 
@@ -378,20 +391,24 @@ For each document independently:
 
 5.⁠ ⁠If quantity is null or blank for any row → treat quantity as "?" and do not add to totals.
 
+6.⁠ ⁠For pricing, record the unit price per line item after consolidation. Do NOT sum prices.
+
 ### Example:
 Raw JSON input:
+
 [
-  {"line_num":1,"sku":"2256104","description":"SolarWinds Observability A250","quantity":1,"unit":"license"},
-  {"line_num":2,"sku":null,"description":"SolarWinds Observability A250","quantity":1,"unit":null},
-  {"line_num":3,"sku":null,"description":"SolarWinds Observability A250","quantity":1,"unit":null}
+  {"line_num":1,"sku":"2256104","description":"SolarWinds Observability A250","quantity":1,"unit":"license","unit_price":500},
+  {"line_num":2,"sku":null,"description":"SolarWinds Observability A250","quantity":1,"unit":null,"unit_price":500},
+  {"line_num":3,"sku":null,"description":"SolarWinds Observability A250","quantity":1,"unit":null,"unit_price":500}
 ]
 
 After consolidation:
-SKU=2256104, Description="SolarWinds Observability A250", Total Qty=3, Unit="license"
+SKU=2256104, Description="SolarWinds Observability A250", Total Qty=3, Unit Price=500 (unchanged)
 
 ---
 
 ## STEP 2 — COMPARE CONSOLIDATED TOTALS ACROSS ALL THREE DOCUMENTS
+
 ### Description Matching Rules:
 
 Apply these rules in order. Use ONLY these exact status strings — no other values permitted:
@@ -423,69 +440,192 @@ Use this status when:
 •⁠  ⁠Quantities differ after consolidation and the difference is not explainable by bundling
 •⁠  ⁠Descriptions refer to clearly different products
 
+When writing notes for a Mismatch caused by an absent document, determine the absent document mechanically:
+•⁠  ⁠If zq_qty is null → absent from ZQ
+•⁠  ⁠If vq_qty is null → absent from VQ
+•⁠  ⁠If ppo_qty is null or "-" → absent from Partner PO
+Always write: "Item present in [X] and [Y] but absent from [Z]" where Z is the document with null quantity. Never reverse this.
+Rule 4 — SKU discrepancy between documents → "Needs Review"
+If the same product is matched by description but carries a different SKU
+in one or more documents (e.g. CS.INSIGHTB.SOLN vs CS.INSIGHT.SOLN):
+  - Set all status fields to "Needs Review"
+  - Note: "SKU discrepancy: [doc A] uses [SKU1], [doc B] uses [SKU2] — 
+    confirm these are the same product"
+  - Still record and compare quantities and prices as normal
+  - Do NOT flag as Mismatch unless quantities or prices also differ
+--
+
+## STEP 3 — PRICE COMPARISON
+
+Two comparisons must be performed per line item.
+
+### Price field mapping:
+
+| Comparison | ZQ field | ZQ currency | External document | External currency |
+|---|---|---|---|---|
+| A — Sell side | ⁠ list_price ⁠ | ⁠ quote_currency ⁠ | Partner PO ⁠ unit_price ⁠ | ⁠ partner_po_currency ⁠ |
+| B — Buy side | ⁠ buy_price ⁠ | ⁠ quote_currency ⁠ | VQ ⁠ unit_price ⁠ | ⁠ vendor_quote_currency ⁠ |
+
 ---
 
-## STEP 3 — DETERMINE FINAL CALL
+### Step 3a — Identify currencies
+
+Read the three currency fields from ZQ:
+•⁠  ⁠⁠ quote_currency ⁠ — applies to both ⁠ list_price ⁠ and ⁠ buy_price ⁠ in ZQ
+•⁠  ⁠⁠ partner_po_currency ⁠ — currency of Partner PO unit prices
+•⁠  ⁠⁠ vendor_quote_currency ⁠ — currency of VQ unit prices
+
+---
+
+### Step 3b — Apply conversion direction
+
+*Comparison A — Sell side (List Price vs. Partner PO)*
+The ZQ list price is the reference. Convert the Partner PO price INTO ⁠ quote_currency ⁠, then compare.
+
+•⁠  ⁠If ⁠ partner_po_currency ⁠ = ⁠ quote_currency ⁠ → no conversion needed; compare directly
+•⁠  ⁠If currencies differ → convert Partner PO price to ⁠ quote_currency ⁠ using the rates below, then compare to ZQ ⁠ list_price ⁠
+
+*Comparison B — Buy side (Buy Price vs. Vendor Quote)*
+The VQ is the reference. Convert the ZQ buy price INTO ⁠ vendor_quote_currency ⁠, then compare.
+
+•⁠  ⁠If ⁠ vendor_quote_currency ⁠ = ⁠ quote_currency ⁠ → no conversion needed; compare directly
+•⁠  ⁠If currencies differ → convert ZQ ⁠ buy_price ⁠ to ⁠ vendor_quote_currency ⁠ using the rates below, then compare to VQ ⁠ unit_price ⁠
+
+*Example:* ZQ buy price = AED 90, VQ currency = USD
+→ Convert: 90 ÷ 3.6725 = USD 24.51
+→ Compare USD 24.51 to VQ unit price
+→ If VQ unit price = USD 24.51 → "Price Match"
+
+---
+
+### Step 3c — Fixed exchange rates
+
+| From | To | Operation |
+|------|----|-----------|
+| USD | AED | × 3.6725 |
+| USD | SAR | × 3.7500 |
+| USD | QAR | × 3.6500 |
+| AED | USD | ÷ 3.6725 |
+| SAR | USD | ÷ 3.7500 |
+| QAR | USD | ÷ 3.6500 |
+
+For cross-rates not listed above (e.g. AED to SAR):
+Convert source currency → USD first, then USD → target currency.
+
+Always record:
+•⁠  The original price in its source currency
+•⁠  c⁠The converted price in the target currency
+•⁠  ⁠The exchange rate and operation applied
+
+---
+
+### Step 3d — Compare and assign price status
+
+Round all converted values to 2 decimal places before comparing.
+A tolerance of ±0.50 in the comparison currency is permitted to absorb rounding differences.
+
+Use ONLY these exact strings for price status:
+"Price Match" | "Price Mismatch" | "Price Needs Review"
+
+•⁠  ⁠If prices are within ±0.50 of each other → "Price Match"
+•⁠  ⁠If prices differ by more than ±0.50 → "Price Mismatch"
+•⁠  ⁠If unit price is null or missing in any document → "Price Needs Review", note "Price missing in [document name]"
+•⁠  ⁠If currency is not one of USD, AED, SAR, QAR → "Price Needs Review", note "Unsupported currency: [currency code]"
+
+---
+
+## STEP 4 — DETERMINE FINAL CALL
 
 Apply these rules in strict order — do not use judgement, apply mechanically:
 
-Rule 1: If ANY item in matching_table has ANY status field = "Mismatch"
+Rule 1: If ANY item has ANY status field = "Mismatch" OR any price status = "Price Mismatch"
          → final_call = "ON HOLD — MISMATCH"
 
-Rule 2: If no Mismatch exists but ANY item has ANY status field = "Needs Review"
+Rule 2: If no Mismatch exists but ANY item has ANY status field = "Needs Review" OR any price status = "Price Needs Review"
          → final_call = "QUERY TO SP"
 
-Rule 3: If ALL status fields across ALL items = "Match"
+Rule 3: If ALL status fields across ALL items = "Match" AND all price statuses = "Price Match"
          → final_call = "CLEAR TO PROCESS"
 
 No exceptions. No other final_call values are permitted.
 
 ---
+
 ## OUTPUT FORMAT
 
 Return ONLY a valid JSON object. No explanation, no markdown, no backticks.
 Use ONLY these exact strings for all status fields: "Match" | "Needs Review" | "Mismatch"
+Use ONLY these exact strings for all price status fields: "Price Match" | "Price Mismatch" | "Price Needs Review"
 
 {
+  "currencies_detected": {
+    "quote_currency": "currency code from ZQ",
+    "partner_po_currency": "currency code from Partner PO",
+    "vendor_quote_currency": "currency code from VQ"
+    "notes":" A 2 to 3 line description of what exchange rates were used for conversion and comparison  with an example in case there is a conversion required otherwise no description needed"
+  },
   "matching_table": [
     {
       "num": 1,
-      "sku": "consolidated SKU — use ZQ SKU if available, else SO, else PO",
+      "sku": "consolidated SKU — use ZQ SKU if available, else VQ, else Partner PO",
       "description": "consolidated description",
+
       "zq_qty": "quantity from ZQ after consolidation, or null if not present",
       "zq_status": "Match|Needs Review|Mismatch",
-      "so_qty": "quantity from SO after consolidation, or null if not present",
-      "so_status": "Match|Needs Review|Mismatch",
-      "po_qty": "quantity from PO after consolidation, or null if not present",
-      "po_status": "Match|Needs Review|Mismatch",
-      "notes": "specific reason for any non-Match status, or null if all Match"
+
+      "vq_qty": "quantity from VQ after consolidation, or null if not present",
+      "vq_status": "Match|Needs Review|Mismatch",
+
+      "ppo_qty": "quantity from Partner PO after consolidation, or null if not present",
+      "ppo_status": "Match|Needs Review|Mismatch",
+
+      "list_price_zq": "list price from ZQ in quote_currency, or null",
+      "partner_ppo_price_original": "unit price from Partner PO in partner_po_currency, or null",
+      "partner_ppo_price_converted": "partner_po_price converted to quote_currency, or null if no conversion needed",
+      "list_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review",
+
+      "buy_price_zq": "buy price from ZQ in quote_currency, or null",
+      "buy_price_zq_converted": "buy_price_zq converted to vendor_quote_currency, or null if no conversion needed",
+      "vendor_quote_price": "unit price from VQ in vendor_quote_currency, or null",
+      "buy_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review",
+
+      "exchange_rate_used": "e.g. '1 USD = 3.6725 AED' or 'AED ÷ 3.6725 = USD' or null if no conversion needed",
+      "notes": "specific reason for any non-Match or non-Price Match status, or null if all match"
     }
   ],
   "unmatched_items": [
-    "List each item that exists in only one document. Format: [DOC SOURCE] SKU/Description — reason"
-  ],
+      "List each item that is missing from one or more documents. Format: [ABSENT FROM: {document name}] SKU/Description — present in {other documents}. Example: [ABSENT FROM: Partner PO] GIB-DRP-L-WEB-BRANCH-1 — present in ZQ and VQ"
+      "Small description of why price mismatch"
+    ],
   "needs_review": [
-    "List each item flagged Needs Review. Format: SKU/Description — specific reason for review"
+    "List each item flagged Needs Review or Price Needs Review. Format: SKU/Description — specific reason"
   ],
   "must_resolve": [
     "List each item blocking processing. Format: SKU/Description — specific action required to resolve"
   ],
-  "overall_summary": "X of Y items Match. Z items Mismatch. W items Needs Review.",
+  "overall_summary": "X of Y items Match. Z items Mismatch. W items Needs Review. A items Price Mismatch. B items Price Needs Review.",
   "final_call": "CLEAR TO PROCESS|QUERY TO SP|ON HOLD — MISMATCH",
-
+  "final_call_detail": [
+    "One line per blocking or review item explaining exactly what needs to be resolved before processing"
+  ]
 }
+ ⁠
 
 ---
 
 ## FIELD DEFINITIONS
 
-matching_table   — one row per unique consolidated SKU/product across all three documents
-unmatched_items  — items present in only one document, no equivalent found in others
-needs_review     — items found across documents but with ambiguity that cannot be auto-resolved
-must_resolve     — any item that prevents final_call from being CLEAR TO PROCESS
-overall_summary  — always use this exact format: "X of Y items Match. Z items Mismatch. W items Needs Review."
-final_call       — determined mechanically by Step 3 rules only
-final_call_detail — empty array [] if final_call is CLEAR TO PROCESS
+currencies_detected          — the three currency codes read from ZQ; drives all conversion logic
+matching_table               — one row per unique consolidated SKU/product across all three documents
+unmatched_items              — items present in only one document, no equivalent found in others
+needs_review                 — items with ambiguity in description, quantity, or price that cannot be auto-resolved
+must_resolve                 — any item that prevents final_call from being CLEAR TO PROCESS
+overall_summary              — always use the exact format shown above
+final_call                   — determined mechanically by Step 4 rules only
+final_call_detail            — empty array [] if final_call is CLEAR TO PROCESS
+buy_price_zq_converted       — ZQ buy price expressed in vendor_quote_currency; this is what gets compared to VQ unit price
+partner_po_price_converted   — Partner PO price expressed in quote_currency; this is what gets compared to ZQ list price
+
 """
 
 
@@ -494,7 +634,7 @@ final_call_detail — empty array [] if final_call is CLEAR TO PROCESS
 #     OPT 2: Auto model selection based on size
 #     OPT 1: Receives compact JSON (fewer tokens)
 # ─────────────────────────────────────────────
-def run_comparison(zoho_text: str, so_text: str, po_text: str, job_id: str = None) -> dict:
+def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, job_id: str = None) -> dict:
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
@@ -514,8 +654,8 @@ def run_comparison(zoho_text: str, so_text: str, po_text: str, job_id: str = Non
             "role": "user",
             "content": [
                 {"type": "text", "text": "## ZOHO QUOTE (ZQ):\n\n" + zoho_text + "\n\n---"},
-                {"type": "text", "text": "## VENDOR QUOTE (VQ) JSON:\n\n" + so_text + "\n\n---"},
-                {"type": "text", "text": "## ⁠Partner PO (PO):\n\n" + po_text + "\n\n---"},
+                {"type": "text", "text": "## VENDOR QUOTE (VQ) JSON:\n\n" + vq_text + "\n\n---"},
+                {"type": "text", "text": "## ⁠Partner PO (PO):\n\n" + ppo_text + "\n\n---"},
                 {"type": "text", "text": MATCHING_PROMPT}
             ]
         }]
@@ -531,7 +671,7 @@ def run_comparison(zoho_text: str, so_text: str, po_text: str, job_id: str = Non
 
     if message.stop_reason == "max_tokens":
         raise Exception("Claude truncated — increase max_tokens")
-
+    print("CLAUDE RESPONSE:{full_text}")
     clean = full_text.replace("```json", "").replace("```", "").strip()
     return json.loads(clean)
 
@@ -540,7 +680,7 @@ def run_comparison(zoho_text: str, so_text: str, po_text: str, job_id: str = Non
 # 11. GENERATE PDF REPORT
 # Uses WeasyPrint — landscape A4, colour pills
 # ─────────────────────────────────────────────
-def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) -> bytes:
+def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, initiated_by: str = "") -> bytes:
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
@@ -551,9 +691,13 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
         if not status or status == "-":
             return '<span class="pill pill-na">N/A</span>'
         s = status.lower()
-        if s == "match":        return '<span class="pill pill-match">Match</span>'
-        if s == "needs review": return '<span class="pill pill-review">Review</span>'
-        if s == "mismatch":     return '<span class="pill pill-miss">Mismatch</span>'
+        # Substring matching (checked in this order) so this works for both
+        # qty statuses ("Match"/"Needs Review"/"Mismatch") and price statuses
+        # ("Price Match"/"Price Needs Review"/"Price Mismatch") — "mismatch"
+        # must be checked before "match" since it contains "match" as a substring.
+        if "mismatch" in s: return '<span class="pill pill-miss">Mismatch</span>'
+        if "review" in s:   return '<span class="pill pill-review">Review</span>'
+        if "match" in s:    return '<span class="pill pill-match">Match</span>'
         return f'<span class="pill pill-na">{status}</span>'
 
     fc = (result.get("final_call") or "").upper()
@@ -566,6 +710,23 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
 
     fc_details = "".join([f"<li>{d}</li>" for d in (result.get("final_call_detail") or [])])
 
+    # ── Currency overview block ──────────────────────────────
+    currencies     = result.get("currencies_detected") or {}
+    qc             = currencies.get("quote_currency") or "—"
+    ppc            = currencies.get("partner_po_currency") or "—"
+    vqc            = currencies.get("vendor_quote_currency") or "—"
+    currency_notes = currencies.get("notes") or ""
+
+    currency_block = f"""<div class="card currency-card">
+        <div class="card-title">Currency Overview</div>
+        <div class="currency-row">
+          <div class="currency-item"><span class="currency-tag-label">Zoho Quote</span><span class="currency-tag-value">{qc}</span></div>
+          <div class="currency-item"><span class="currency-tag-label">Partner PO</span><span class="currency-tag-value">{ppc}</span></div>
+          <div class="currency-item"><span class="currency-tag-label">Vendor Quote</span><span class="currency-tag-value">{vqc}</span></div>
+        </div>
+        {f'<p class="currency-notes">{currency_notes}</p>' if currency_notes else ""}
+      </div>"""
+
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
@@ -575,12 +736,14 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
         table_rows += f"""<tr style="background:{row_bg}">
             <td style="text-align:center;font-weight:600">{r.get("num","")}</td>
             <td style="font-family:monospace;font-size:9px;color:#374151;word-break:break-all">{r.get("sku","") or "None"}</td>
-            <td style="text-align:center">{r.get("so_qty","") or "-"}</td>
+            <td style="text-align:center">{r.get("ppo_qty","") or "-"}</td>
             <td style="text-align:center;font-weight:600">{r.get("zq_qty","") or "-"}</td>
             <td style="text-align:center">{status_badge(r.get("zq_status"))}</td>
-            <td style="text-align:center;font-weight:600">{r.get("po_qty","") or "-"}</td>
-            <td style="text-align:center">{status_badge(r.get("so_status"))}</td>
-            <td style="text-align:center">{status_badge(r.get("po_status"))}</td>
+            <td style="text-align:center;font-weight:600">{r.get("vq_qty","") or "-"}</td>
+            <td style="text-align:center">{status_badge(r.get("ppo_status"))}</td>
+            <td style="text-align:center">{status_badge(r.get("vq_status"))}</td>
+            <td style="text-align:center">{status_badge(r.get("list_price_comparison_status"))}</td>
+            <td style="text-align:center">{status_badge(r.get("buy_price_comparison_status"))}</td>
             <td style="font-size:9px;color:#6b7280;line-height:1.4">{r.get("notes","")}</td>
         </tr>"""
 
@@ -591,6 +754,7 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
     needs_review = "".join([f'<li class="item-amber">{i}</li>' for i in (result.get("needs_review") or [])]) or "<li>None</li>"
     unmatched    = "".join([f'<span class="tag">{i}</span>' for i in (result.get("unmatched_items") or [])])
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    by_line      = f" &nbsp;|&nbsp; Initiated by: {initiated_by}" if initiated_by else ""
 
     html_content = f"""<!DOCTYPE html>
 <html>
@@ -613,14 +777,16 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
   table {{ width: 100%; border-collapse: collapse; font-size: 9px; }}
   thead th {{ background: #1a1a2e; color: #fff; padding: 6px 7px; text-align: left; font-weight: 600; font-size: 8px; text-transform: uppercase; letter-spacing: 0.04em; }}
   thead th:nth-child(1) {{ width: 28px; }}
-  thead th:nth-child(2) {{ width: 130px; }}
+  thead th:nth-child(2) {{ width: 120px; }}
   thead th:nth-child(3),
   thead th:nth-child(4),
-  thead th:nth-child(6) {{ width: 45px; text-align: center; }}
+  thead th:nth-child(6) {{ width: 42px; text-align: center; }}
   thead th:nth-child(5),
   thead th:nth-child(7),
-  thead th:nth-child(8) {{ width: 75px; text-align: center; }}
-  thead th:nth-child(9) {{ width: auto; }}
+  thead th:nth-child(8),
+  thead th:nth-child(9),
+  thead th:nth-child(10) {{ width: 68px; text-align: center; }}
+  thead th:nth-child(11) {{ width: auto; }}
   tbody td {{ padding: 5px 7px; border-bottom: 1px solid #f3f4f6; vertical-align: top; line-height: 1.4; }}
   .pill {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 8px; font-weight: 600; }}
   .pill-match  {{ background: #d1fae5; color: #065f46; }}
@@ -637,16 +803,23 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
   li.item-amber {{ border-left: 3px solid #f59e0b; }}
   .tag {{ display: inline-block; background: #fee2e2; color: #991b1b; border-radius: 3px; padding: 1px 5px; font-size: 8px; margin: 2px; font-family: monospace; }}
   .overall-text {{ font-size: 9px; color: #374151; line-height: 1.6; }}
+  .currency-card {{ padding-bottom: 10px; }}
+  .currency-row {{ display: flex; gap: 12px; margin-bottom: 6px; }}
+  .currency-item {{ background: #f4f6f9; border-radius: 5px; padding: 5px 10px; display: flex; flex-direction: column; gap: 1px; }}
+  .currency-tag-label {{ font-size: 7px; text-transform: uppercase; letter-spacing: 0.05em; color: #9ca3af; font-weight: 700; }}
+  .currency-tag-value {{ font-size: 11px; font-weight: 700; color: #1a1a2e; font-family: monospace; }}
+  .currency-notes {{ font-size: 9px; color: #374151; line-height: 1.5; border-top: 1px solid #f3f4f6; padding-top: 6px; margin-top: 4px; }}
 </style>
 </head>
 <body>
   <div class="header">
     <h1>Procurement Analysis Report</h1>
-    <div class="subtitle">Quote: {quote_subject} &nbsp;|&nbsp; Generated: {generated_at}</div>
+    <div class="subtitle">Quote: {quote_subject} &nbsp;|&nbsp; Generated: {generated_at}{by_line}</div>
   </div>
+  {currency_block}
   <div class="banner">
     <div class="banner-title">{result.get("final_call","")}</div>
-    <ul>{fc_details}</ul>
+   <!-- <ul>{fc_details}</ul> -->
   </div>
   <div class="card">
     <div class="card-title">Section 1 - Three-Way Item Matching</div>
@@ -654,12 +827,14 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None) ->
       <thead>
         <tr>
           <th>#</th><th>ZQ SKU</th>
-          <th style="text-align:center">PO Qty</th>
+          <th style="text-align:center">PPO Qty</th>
           <th style="text-align:center">ZQ Qty</th>
-          <th style="text-align:center">ZQ-PO</th>
+          <th style="text-align:center">ZQ&#8596;PPO</th>
           <th style="text-align:center">VQ Qty</th>
-          <th style="text-align:center">ZQ-VQ</th>
-          <th style="text-align:center">PO-VQ</th>
+          <th style="text-align:center">ZQ&#8596;VQ</th>
+          <th style="text-align:center">PPO&#8596;VQ</th>
+          <th style="text-align:center">ZQ-PPO Price</th>
+          <th style="text-align:center">ZQ-VQ Price</th>
           <th>Notes</th>
         </tr>
       </thead>
@@ -713,7 +888,7 @@ def auto_cancel_watcher(job_id: str, timeout_seconds: int = 6):
 # 12. BACKGROUND JOB
 #     OPT 4: Parallel PDF downloads
 # ─────────────────────────────────────────────
-def process_quote_job(job_id: str, quote_id: str):
+def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
     try:
         jobs[job_id] = {"status": "processing", "phase": "Initialising..."}
         t0 = time.time()
@@ -730,6 +905,7 @@ def process_quote_job(job_id: str, quote_id: str):
 
         if is_cancelled(job_id): return
         zoho_text = format_zoho_quote(quote)
+        print(f"Quote items to be sent to Gemini: {zoho_text}")
         # Build dynamic filename from Quotation_Reference field
         quote_ref    = quote.get("Quotation_Reference", "")
         # Sanitise — remove characters not allowed in filenames
@@ -738,14 +914,14 @@ def process_quote_job(job_id: str, quote_id: str):
         print(f"[{job_id}] Report filename: {report_name}")
 
         # ── Validate attachments exist before proceeding ──────────
-        so_field = quote.get(SO_PDF_FIELD)
-        po_field = quote.get(PO_PDF_FIELD)
+        ppo_field = quote.get(PPO_PDF_FIELD)
+        vq_field = quote.get(VQ_PDF_FIELD)
 
         missing = []
-        if not so_field or not isinstance(so_field, list) or len(so_field) == 0:
-            missing.append(f"Partner PO PDF (field: {SO_PDF_FIELD})")
-        if not po_field or not isinstance(po_field, list) or len(po_field) == 0:
-            missing.append(f"Vendor Quote PDF (field: {PO_PDF_FIELD})")
+        if not ppo_field or not isinstance(ppo_field, list) or len(ppo_field) == 0:
+            missing.append(f"Partner PO PDF (field: {PPO_PDF_FIELD})")
+        if not vq_field or not isinstance(vq_field, list) or len(vq_field) == 0:
+            missing.append(f"Vendor Quote PDF (field: {VQ_PDF_FIELD})")
 
         if missing:
             raise Exception(
@@ -754,41 +930,54 @@ def process_quote_job(job_id: str, quote_id: str):
                 + "\n".join(f"  - {m}" for m in missing)
             )
 
-        fid_so = so_field[0].get('file_Id')
-        fid_po = po_field[0].get('file_Id')
+        fid_ppo = ppo_field[0].get('file_Id')
+        fid_vq = vq_field[0].get('file_Id')
 
-        if not fid_so:
+        if not fid_ppo:
             raise Exception(
                 f"Partner PO PDF  is attached but has no file ID. "
-                f"Please re-attach the {SO_PDF_FIELD} file and try again."
+                f"Please re-attach the {PPO_PDF_FIELD} file and try again."
             )
-        if not fid_po:
+        if not fid_vq:
             raise Exception(
                 f"Vendor Quote PDF is attached but has no file ID. "
-                f"Please re-attach the {PO_PDF_FIELD} file and try again."
+                f"Please re-attach the {VQ_PDF_FIELD} file and try again."
             )
 
-        print(f"[{job_id}] Attachments validated — SO: {fid_so}, PO: {fid_po}")
+        print(f"[{job_id}] Attachments validated — PPO: {fid_ppo}, PO: {fid_vq}")
         jobs[job_id]["phase"] = "Downloading PDF attachments..."
 
         # OPT 4: Download both PDFs in parallel
 
-        print(f"[{job_id}] 📥 Downloading SO + PO in parallel...")
+        print(f"[{job_id}] 📥 Downloading PPO + VQ in parallel...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_so_dl = executor.submit(download_zoho_file, fid_so, token)
-            future_po_dl = executor.submit(download_zoho_file, fid_po, token)
+            future_ppo_dl = executor.submit(download_zoho_file, fid_ppo, token)
+            future_vq_dl = executor.submit(download_zoho_file, fid_vq, token)
 
-            while not (future_so_dl.done() and future_po_dl.done()):
+            while not (future_ppo_dl.done() and future_vq_dl.done()):
                 time.sleep(0.5)
                 if is_cancelled(job_id):
-                    future_so_dl.cancel()
-                    future_po_dl.cancel()
+                    future_ppo_dl.cancel()
+                    future_vq_dl.cancel()
                     return
 
-            so_bytes = future_so_dl.result()
-            po_bytes = future_po_dl.result()
+            ppo_bytes = future_ppo_dl.result()
+            vq_bytes = future_vq_dl.result()
 
         print(f"[{job_id}] ⏱ Downloads done: {time.time()-t0:.1f}s")
+
+        invalid_files = []
+        if not is_valid_pdf(ppo_bytes):
+            invalid_files.append(f"Partner PO PDF (field: {PPO_PDF_FIELD})")
+        if not is_valid_pdf(vq_bytes):
+            invalid_files.append(f"Vendor Quote PDF (field: {VQ_PDF_FIELD})")
+
+        if invalid_files:
+            raise Exception(
+                "The following attachments are not valid PDF files. "
+                "Please remove them and attach a PDF instead:\n"
+                + "\n".join(f"  - {f}" for f in invalid_files)
+            )
         jobs[job_id]["phase"] = "Extracting line items with Gemini AI..."
 
         if is_cancelled(job_id): return
@@ -797,34 +986,34 @@ def process_quote_job(job_id: str, quote_id: str):
         # Gemini extractions in parallel
         print(f"[{job_id}] 🔍 Gemini extraction (parallel)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_so = executor.submit(extract_pdf_gemini, so_bytes, "SO PDF", gemini_model, job_id)
-            future_po = executor.submit(extract_pdf_gemini, po_bytes, "PO PDF", gemini_model, job_id)
+            future_ppo = executor.submit(extract_pdf_gemini, ppo_bytes, "Partner PO PDF", gemini_model, job_id)
+            future_vq = executor.submit(extract_pdf_gemini, vq_bytes, "VQ PDF", gemini_model, job_id)
 
-            while not (future_so.done() and future_po.done()):
+            while not (future_ppo.done() and future_vq.done()):
                 time.sleep(1)
                 if is_cancelled(job_id):
                     print(f"[{job_id}] ❌ Cancelled during Gemini extraction")
-                    future_so.cancel()
-                    future_po.cancel()
+                    future_ppo.cancel()
+                    future_vq.cancel()
                     return
 
-            so_text = future_so.result()
-            po_text = future_po.result()
+            ppo_text = future_ppo.result()
+            vq_text = future_vq.result()
 
-        print("PO TEXT from Gemini:"+po_text)
-        print("SO TEXT from Gemini:"+so_text)
+        print("VQ TEXT from Gemini:"+vq_text)
+        print("Partner PO TEXT from Gemini:"+ppo_text)
         print(f"[{job_id}] ⏱ Gemini done: {time.time()-t0:.1f}s")
         jobs[job_id]["phase"] = "Comparing documents with Claude AI..."
 
         if is_cancelled(job_id): return
-        result = run_comparison(zoho_text, so_text, po_text, job_id)
+        result = run_comparison(zoho_text, ppo_text, vq_text, job_id)
         print(f"The final result from claude is : {result}")
 
         print(f"[{job_id}] ⏱ Claude done: {time.time()-t0:.1f}s")
         jobs[job_id]["phase"] = "Generating PDF report..."
 
         if is_cancelled(job_id): return
-        pdf_bytes     = generate_pdf_report(result, quote.get("Subject", quote_id), job_id)
+        pdf_bytes     = generate_pdf_report(result, quote.get("Subject", quote_id), job_id, initiated_by)
         print(f"[{job_id}] ⏱ PDF Report generation done: {time.time()-t0:.1f}s")
         jobs[job_id]["phase"] = "Attaching report to Zoho quote..."
 
@@ -849,15 +1038,17 @@ def process_quote_job(job_id: str, quote_id: str):
         if jobs.get(job_id, {}).get("status") != "cancelled":
             jobs[job_id] = {"status": "error", "error": str(e)}
 
-
+def is_valid_pdf(file_bytes: bytes) -> bool:
+    """Check the actual file signature, not just filename/extension."""
+    return file_bytes[:5] == b'%PDF-'
 # ─────────────────────────────────────────────
 # 13. FASTAPI ENDPOINTS
 # ─────────────────────────────────────────────
 
 @app.post("/analyze-quote")
 def analyze_quote(payload: dict, background_tasks: BackgroundTasks):
-    print("LOADING FROM ENV VARIABLES WITH SECRETS")
-    quote_id = payload.get("quote_id")
+    quote_id     = payload.get("quote_id")
+    initiated_by = payload.get("initiated_by", "")
     if not quote_id:
         return JSONResponse(status_code=400, content={"error": "quote_id missing"})
 
@@ -865,7 +1056,7 @@ def analyze_quote(payload: dict, background_tasks: BackgroundTasks):
     jobs[job_id]      = {"status": "processing"}
     last_poll[job_id] = time.time()
 
-    background_tasks.add_task(process_quote_job, job_id, quote_id)
+    background_tasks.add_task(process_quote_job, job_id, quote_id, initiated_by)
 
     threading.Thread(
         target=auto_cancel_watcher,

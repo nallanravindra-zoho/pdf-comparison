@@ -30,14 +30,16 @@
 
   thead th { background: #1a1a2e; color: #fff; padding: 9px 10px; text-align: left; font-weight: 600;  }
   table th:nth-child(1) { width: 35px; }   /* # */
-  table th:nth-child(2) { width: 160px; }  /* ZQ SKU */
-  table th:nth-child(3) { width: 55px; }   /* SO Qty */
-  table th:nth-child(4) { width: 55px; }   /* ZQ Qty */
-  table th:nth-child(5) { width: 90px; }   /* ZQ-SO */
-  table th:nth-child(6) { width: 55px; }   /* PO Qty */
-  table th:nth-child(7) { width: 90px; }   /* ZQ-PO */
-  table th:nth-child(8) { width: 90px; }   /* SO-PO */
-  table th:nth-child(9) { width: auto; }   /* Notes — takes remaining space */
+  table th:nth-child(2) { width: 140px; }  /* ZQ SKU */
+  table th:nth-child(3) { width: 50px; }   /* PPO Qty */
+  table th:nth-child(4) { width: 50px; }   /* ZQ Qty */
+  table th:nth-child(5) { width: 80px; }   /* ZQ-PPO Qty status */
+  table th:nth-child(6) { width: 50px; }   /* VQ Qty */
+  table th:nth-child(7) { width: 80px; }   /* ZQ-VQ Qty status */
+  table th:nth-child(8) { width: 80px; }   /* PPO-VQ Qty status */
+  table th:nth-child(9) { width: 90px; }   /* ZQ-PPO Price */
+  table th:nth-child(10){ width: 90px; }   /* ZQ-VQ Price */
+  table th:nth-child(11){ width: auto; }   /* Notes — takes remaining space */
   tbody tr:hover { background: #eff6ff; }
   tbody td {
     padding: 8px 10px;
@@ -72,6 +74,13 @@
   .summary-list li.red   { border-left-color: #ef4444; }
   .summary-list li.amber { border-left-color: #f59e0b; }
   .tag { display: inline-block; background: #fee2e2; color: #991b1b; border-radius: 4px; padding: 3px 8px; font-size: 11px; margin: 3px; font-family: monospace; }
+
+  .currency-card { padding-top: 14px; }
+  .currency-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  .currency-item { background: #f4f6f9; border-radius: 8px; padding: 8px 14px; display: flex; flex-direction: column; gap: 2px; min-width: 110px; }
+  .currency-tag-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #9ca3af; font-weight: 700; }
+  .currency-tag-value { font-size: 15px; font-weight: 700; color: #1a1a2e; font-family: monospace; }
+  .currency-notes { font-size: 12px; color: #374151; line-height: 1.6; border-top: 1px solid #f3f4f6; padding-top: 10px; margin-top: 4px; }
 
   .state-box { text-align: center; padding: 60px 20px; color: #9ca3af; font-size: 13px; }
   .spinner-wrap {
@@ -166,6 +175,11 @@
   .btn-secondary { background: #e5e7eb; color: #374151; }
   .btn-danger    { background: #fee2e2; color: #991b1b; }
 
+  /* ── RUN CONFIRMATION ── */
+  .confirm-box { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 28px 28px; margin-bottom: 20px; border-left: 5px solid #6366f1; }
+  .confirm-box h3 { font-size: 15px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+  .confirm-box p  { font-size: 12px; color: #6b7280; margin-bottom: 22px; line-height: 1.6; }
+
   /* ── SUCCESS BANNER ── */
   .saved-banner {
     background: #d1fae5; border: 1px solid #6ee7b7;
@@ -199,6 +213,7 @@ var MAX_POLL   = 120;
 var POLL_MS    = 3000;
 var pollTimer  = null;
 var currentQuoteId = null;
+var currentUserName = "";
 var currentJobId = null;
 // ── UI HELPERS ────────────────────────────────────────────────
 // Phase definitions — order determines progress list
@@ -305,8 +320,14 @@ function parseResponse(response) {
 }
 
 // ── STEP 0: CHECK FOR EXISTING REPORT ────────────────────────
+// Called AFTER the user has already clicked "OK" on showRunConfirmation,
+// so timer state is guaranteed clean when we enter here.
 function checkExistingReport(quoteId) {
-  showLoading("Checking for existing report&#8230;", 0);
+  // Show a lightweight "checking" indicator without starting the analysis timer
+  document.getElementById("app").innerHTML =
+    '<div class="state-box" style="padding:40px 20px">'
+    + '<div class="phase-label">Checking for existing report&#8230;</div>'
+    + '</div>';
 
   ZOHO.CRM.HTTP.get({
     url: CHECK_URL + quoteId,
@@ -326,6 +347,7 @@ function checkExistingReport(quoteId) {
       if (parsed.exists) {
         showExistingReportPrompt(quoteId, parsed);
       } else {
+        // No existing report and user already confirmed — go straight to analysis
         runAnalysis(quoteId);
       }
 
@@ -347,6 +369,7 @@ function checkExistingReport(quoteId) {
 
 // ── SHOW EXISTING REPORT OPTIONS ─────────────────────────────
 function showExistingReportPrompt(quoteId, reportInfo) {
+  stopTimer(); // Ensure no dangling interval before rendering static prompt
   var createdAt = reportInfo.created_time
     ? ' Generated: ' + reportInfo.created_time
     : "";
@@ -358,7 +381,8 @@ function showExistingReportPrompt(quoteId, reportInfo) {
     + '&#128204; To view it, close this popup and open the <strong>Attachments</strong> '
     + 'section in the left panel of this quote record.</p>'
     + '<div class="btn-row">'
-    + '<button class="btn btn-secondary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Fresh Comparison</button>'
+    + '<button class="btn btn-primary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Fresh Comparison</button>'
+    + '<button class="btn btn-secondary" onclick="closeWidget()">&#10007;&nbsp; Cancel</button>'
     + '</div></div>';
 }
 // ── OPEN EXISTING REPORT (inline in widget) ───────────────────
@@ -378,6 +402,25 @@ function openExistingReport(quoteId, attachmentId) {
     + '</div></div>';
 }
 
+// ── STEP 0b: SIMPLE RUN CONFIRMATION ─────────────────────────
+function showRunConfirmation(quoteId) {
+  stopTimer(); // Always clear timer state before showing a static prompt
+  document.getElementById("app").innerHTML =
+    '<div class="confirm-box">'
+    + '<h3>&#128203; Start Document Comparison?</h3>'
+    + '<p>This will compare the Zoho Quote, Vendor Quote PDF, and Partner PO PDF '
+    + 'for SKU, quantity, and price alignment, then attach a PDF report to this quote record.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-primary" onclick="checkExistingReport(\'' + quoteId + '\')">&#10003;&nbsp; OK, Start Comparison</button>'
+    + '<button class="btn btn-secondary" onclick="closeWidget()">&#10007;&nbsp; Cancel</button>'
+    + '</div></div>';
+}
+
+function closeWidget() {
+  try { ZOHO.CRM.UI.Popup.close(); } catch(e) {}
+  try { window.close(); } catch(e) {}
+}
+
 // ── STEP 1: START ANALYSIS JOB ───────────────────────────────
 function runAnalysis(quoteId) {
   if (pollTimer) { clearTimeout(pollTimer); }
@@ -388,7 +431,7 @@ function runAnalysis(quoteId) {
 
   ZOHO.CRM.HTTP.post({
     url: START_URL,
-    body: JSON.stringify({ quote_id: quoteId }),
+    body: JSON.stringify({ quote_id: quoteId, initiated_by: currentUserName }),
     headers: { "Content-Type": "application/json" }
   }).then(function(response) {
     try {
@@ -453,10 +496,31 @@ function pollJobStatus(jobId, quoteId, attempt) {
 function statusPill(status) {
   if (!status || status === "-") return '<span class="pill pill-na">N/A</span>';
   var s = status.toLowerCase();
-  if (s === "match")        return '<span class="pill pill-match">&#10003; Match</span>';
-  if (s === "needs review") return '<span class="pill pill-review">&#9888; Review</span>';
-  if (s === "mismatch")     return '<span class="pill pill-miss">&#128308; Mismatch</span>';
+  // Substring matching (checked in this order) so this works for both
+  // qty statuses ("Match"/"Needs Review"/"Mismatch") and price statuses
+  // ("Price Match"/"Price Needs Review"/"Price Mismatch") — "mismatch" must
+  // be checked before "match" since it contains "match" as a substring.
+  if (s.indexOf("mismatch") !== -1) return '<span class="pill pill-miss">&#128308; Mismatch</span>';
+  if (s.indexOf("review")   !== -1) return '<span class="pill pill-review">&#9888; Review</span>';
+  if (s.indexOf("match")    !== -1) return '<span class="pill pill-match">&#10003; Match</span>';
   return '<span class="pill pill-na">' + status + "</span>";
+}
+
+function currencyCard(data) {
+  var c     = data.currencies_detected || {};
+  var qc    = c.quote_currency || "—";
+  var ppc   = c.partner_po_currency || "—";
+  var vqc   = c.vendor_quote_currency || "—";
+  var notes = c.notes || "";
+  return '<div class="card currency-card">'
+    + '<h3>&#128176; Currency Overview</h3>'
+    + '<div class="currency-row">'
+    +   '<div class="currency-item"><span class="currency-tag-label">Zoho Quote</span><span class="currency-tag-value">' + qc + '</span></div>'
+    +   '<div class="currency-item"><span class="currency-tag-label">Partner PO</span><span class="currency-tag-value">' + ppc + '</span></div>'
+    +   '<div class="currency-item"><span class="currency-tag-label">Vendor Quote</span><span class="currency-tag-value">' + vqc + '</span></div>'
+    + '</div>'
+    + (notes ? '<p class="currency-notes">' + notes + '</p>' : '')
+    + '</div>';
 }
 
 function finalCallBanner(data) {
@@ -464,7 +528,8 @@ function finalCallBanner(data) {
   var cls = "query", icon = "!";
   if (fc.indexOf("CLEAR") !== -1) { cls = "clear"; icon = "&#10003;"; }
   if (fc.indexOf("HOLD")  !== -1) { cls = "hold";  icon = "&#10007;"; }
-  var details = (data.final_call_detail || []).map(function(d) { return "<li>&#8226; " + d + "</li>"; }).join("");
+  //var details = (data.final_call_detail || []).map(function(d) { return "<li>&#8226; " + d + "</li>"; }).join("");
+  var details ='';
   return '<div class="final-call ' + cls + '">'
     + '<div class="fc-icon">' + icon + "</div>"
     + '<div class="fc-body"><div class="fc-title">' + (data.final_call || "") + "</div>"
@@ -474,19 +539,21 @@ function finalCallBanner(data) {
 
 function matchingTable(rows) {
   if (!rows || rows.length === 0) return '<p style="color:#9ca3af;font-size:12px">No items found.</p>';
-  var headers = ["#","ZQ SKU","SO Qty","ZQ Qty","ZQ&#8596;SO","PO Qty","ZQ&#8596;PO","SO&#8596;PO","Notes"]
+  var headers = ["#","ZQ SKU","PPO Qty","ZQ Qty","ZQ&#8596;PPO","VQ Qty","ZQ&#8596;VQ","PPO&#8596;VQ","ZQ-PPO Price","ZQ-VQ Price","Notes"]
     .map(function(h) { return "<th>" + h + "</th>"; }).join("");
   var bodyRows = rows.map(function(r) {
-    var qtyMismatch = r.po_qty && r.zq_qty && String(r.po_qty) !== String(r.zq_qty);
+    var qtyMismatch = r.vq_qty && r.zq_qty && String(r.vq_qty) !== String(r.zq_qty);
     return "<tr>"
       + '<td class="qty">'        + (r.num    || "")  + "</td>"
       + '<td class="sku">'        + (r.sku || "-") + "</td>"
-      + '<td class="qty">'        + (r.so_qty || "-") + "</td>"
+      + '<td class="qty">'        + (r.ppo_qty || "-") + "</td>"
       + '<td class="qty">'        + (r.zq_qty || "-") + "</td>"
       + "<td>"                    + statusPill(r.zq_status) + "</td>"
-      + '<td class="qty'          + (qtyMismatch ? " qty-diff" : "") + '">' + (r.po_qty || "-") + "</td>"
-      + "<td>"                    + statusPill(r.so_status) + "</td>"
-      + "<td>"                    + statusPill(r.po_status) + "</td>"
+      + '<td class="qty'          + (qtyMismatch ? " qty-diff" : "") + '">' + (r.vq_qty || "-") + "</td>"
+      + "<td>"                    + statusPill(r.ppo_status) + "</td>"
+      + "<td>"                    + statusPill(r.vq_status) + "</td>"
+      + "<td>"                    + statusPill(r.list_price_comparison_status) + "</td>"
+      + "<td>"                    + statusPill(r.buy_price_comparison_status) + "</td>"
       + '<td class="notes-cell">' + (r.notes  || "") + "</td>"
       + "</tr>";
   }).join("");
@@ -516,7 +583,7 @@ function render(data, generatedAt,quoteRef) {
       + (quoteRef ? ' &nbsp;|&nbsp; <strong>' + quoteRef + '</strong>' : '')
       + ' &nbsp;(' + generatedAt + ')'
       + ' &nbsp;<button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" '
-      + 'onclick="runAnalysis(\'' + currentQuoteId + '\')">&#128260; Run Fresh</button></div>'
+      + 'onclick="showRunConfirmation(\'' + currentQuoteId + '\')">&#128260; Run Fresh</button></div>'
     : "";
     // Quote reference header
   var quoteHeader = (quoteRef)
@@ -531,6 +598,7 @@ function render(data, generatedAt,quoteRef) {
   document.getElementById("app").innerHTML =
     savedBanner
     + quoteHeader
+    + currencyCard(data)
     + finalCallBanner(data)
     + '<div class="card"><h3>&#128203; Section 1 &#8212; Three-Way Item Matching</h3>'
     + matchingTable(data.matching_table || []) + "</div>"
@@ -572,8 +640,23 @@ ZOHO.embeddedApp.on("PageLoad", function(data) {
   }
   currentQuoteId = quoteId;
 
-  // First check if report already exists
-  checkExistingReport(quoteId);
+  // Fetch logged-in user name so the PDF report can record who initiated it
+  ZOHO.CRM.CONFIG.getCurrentUser().then(function(resp) {
+    try {
+      var u = resp && resp.users && resp.users[0];
+      currentUserName = u ? (u.full_name || u.email || "") : "";
+    } catch(e) {
+      currentUserName = "";
+    }
+  }).catch(function() {
+    currentUserName = "";
+  });
+
+  // Show confirmation FIRST before any API calls or loading state starts.
+  // This avoids the dangling _timerInterval bug where showLoading() fires
+  // during checkExistingReport, then showRunConfirmation() replaces the DOM
+  // without calling stopTimer(), leaving dirty timer state for runAnalysis.
+  showRunConfirmation(quoteId);
 });
 
 ZOHO.embeddedApp.init();
