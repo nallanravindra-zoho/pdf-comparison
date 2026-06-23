@@ -1,0 +1,75 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ───────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment / secrets ─────────────────────────────────────
+.env
+.env.*
+*.env
+secrets/
+service-account*.json
+*-credentials.json
+gcloud-key*.json
+
+# ── GCP / Cloud Build ─────────────────────────────────────────
+.gcloudignore
+cloudbuild-local/
+
+# ── Zoho widget build artifacts ───────────────────────────────
+widget-sandbox.zip
+widget-prod.zip
+*.zip
+
+# ── Prompt files with real data (keep templates, not actuals) ──
+# Uncomment if you don't want prompts in git at all
+# prompts/*.txt
+
+# ── PDF test files ────────────────────────────────────────────
+*.pdf
+test_pdfs/
+sample_docs/
+
+# ── Local testing / dev scripts ───────────────────────────────
+test_*.py
+scratch_*.py
+debug_*.py
+render_preview.js
+preview_*.html
+preview_*.png
+extracted.js
+
+# ── IDE / editor ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── WeasyPrint / font cache ───────────────────────────────────
+fontconfig/
+.fontconfig/
+
+# ── Node (if any tooling is added later) ──────────────────────
+node_modules/
+npm-debug.log*
+.app.py.swp

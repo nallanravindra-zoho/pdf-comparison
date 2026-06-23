@@ -15,9 +15,34 @@ import concurrent.futures
 import threading
 import os
 from dotenv import load_dotenv
-
+from google.cloud import storage as gcs
 app = FastAPI()
+PROMPT_BUCKET = os.environ.get("PROMPT_BUCKET", "sku-auditor-prompts")
+_PROMPT_CACHE_TTL = 300  # seconds — change to 60 for faster iteration during testing
 
+_prompt_cache: dict = {}
+
+def load_prompt(filename: str) -> str:
+    """Load a prompt from GCS. Cached for PROMPT_CACHE_TTL seconds."""
+    now = time.time()
+    if filename in _prompt_cache:
+        text, fetched_at = _prompt_cache[filename]
+        if now - fetched_at < _PROMPT_CACHE_TTL:
+            return text
+    try:
+        client = gcs.Client()
+        blob   = client.bucket(PROMPT_BUCKET).blob(filename)
+        text   = blob.download_as_text(encoding="utf-8")
+        _prompt_cache[filename] = (text, now)
+        print(f"[prompts] Loaded {filename} from GCS ({len(text)} chars)")
+        return text
+    except Exception as e:
+        print(f"[prompts] ⚠️ Failed to load {filename} from GCS: {e}")
+        # Fall back to cached version if available, even if stale
+        if filename in _prompt_cache:
+            print(f"[prompts] Using stale cached version of {filename}")
+            return _prompt_cache[filename][0]
+        raise RuntimeError(f"Could not load prompt '{filename}' and no cache available") from e
 # ─────────────────────────────────────────────
 # WEASYPRINT WARMUP
 # Pre-loads fonts at startup so first PDF is fast
@@ -285,7 +310,7 @@ def get_gemini_model() -> str:
 #    OPT 1: Returns compact JSON string
 #    (fewer tokens to Claude vs verbose text)
 # ─────────────────────────────────────────────
-def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None) -> str:
+def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None, prompt: str= None) -> str:
     if job_id and is_cancelled(job_id):
         print(f"🔍 Cancelled before {label} extraction")
         raise Exception("Job cancelled by user")
@@ -295,37 +320,11 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: st
         generation_config={"temperature": 0, "response_mime_type": "application/json"}
     )
 
-    prompt = """
-Extract ALL line items from this procurement document, including duplicates.
-
-IMPORTANT RULES:
-1.⁠ ⁠Extract EVERY line item row — even if it looks identical to another row
-2.⁠ ⁠Do NOT deduplicate or merge rows — if the same SKU appears 3 times, return 3 separate entries
-3.⁠ ⁠Do NOT assume repeated rows are errors — they represent separate line items
-4.⁠ ⁠Each physical row in the document = one entry in your output
-5.⁠ ⁠Only skip rows that are clearly headers, totals, subtotals, taxes, shipping, or page numbers
-
-For each line item return exactly these fields:
-•⁠  ⁠line_num   : line number as it appears in the document (if none, use sequential 1, 2, 3...)
-•⁠  ⁠sku        : product code or SKU exactly as written (use null if missing or not present)
-•⁠  ⁠description: full product description exactly as written, no truncation
-•⁠  ⁠quantity   : numeric value only, no units (use null if not present or not readable)
-•⁠  list_unit_price  : numeric value only, no units (use null if not present or not readable)
-
-Do NOT include: totals, taxes, dates, addresses, payment terms, or currency.
-
-Return ONLY a valid JSON array. No explanation, no markdown, no backticks.
-
-Example output format:
-[
-  {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, list_unit_price":4500},
-  {"line_num": 2, "sku": null, "description": "FortiGate 100F Hardware", "quantity": 1, list_unit_price":null}
-]
-"""
+    gemini_prompt = prompt
 
     print(f"🔍 Extracting {label} via Gemini ({model_name})...")
     response = model.generate_content(
-        [{"mime_type": "application/pdf", "data": pdf_bytes}, prompt],
+        [{"mime_type": "application/pdf", "data": pdf_bytes}, gemini_prompt],
         request_options={"timeout": 120}
     )
 
@@ -351,282 +350,7 @@ Example output format:
 # ─────────────────────────────────────────────
 # 9. MATCHING PROMPT
 # ─────────────────────────────────────────────
-MATCHING_PROMPT = """
-You are a procurement document analyst for Cyberknight Technologies, a cybersecurity distributor.
-
-Three sources of data are provided:
-•⁠  ⁠Zoho Quote (ZQ) — the internal quote record from Cyberknight's CRM (text format)
-•⁠  ⁠Vendor Quote (VQ) — what Cyberknight is BUYING from the vendor (JSON extracted line items)
-•⁠  ⁠Partner PO — what the partner is BUYING from Cyberknight (JSON extracted line items)
-
-Your job is to compare ALL THREE for SKU code + product description + quantity alignment, AND to validate pricing.
-Reference numbers, addresses, and payment terms WILL differ — do not flag those.
-
----
-
-## STEP 1 — CONSOLIDATE EACH DOCUMENT INDEPENDENTLY
-
-Before any comparison, consolidate line items within EACH document separately.
-Do NOT consolidate across documents.
-
-### Consolidation Rules:
-
-For each document independently:
-
-1.⁠ ⁠Group rows by SKU where SKU is not null.
-
-2.⁠ ⁠For rows where SKU is null:
-   - Compare description to rows that have a SKU using this rule:
-     - A null-SKU row is the SAME product as a SKU row ONLY IF all three of the following are true:
-       a. The root product name is identical (e.g. both say "FortiGate 100F")
-       b. The vendor/brand name is identical (e.g. both say "Fortinet")
-       c. The tier, size, or license level indicator is identical (e.g. both say "UTP" or both say "Enterprise")
-     - If ALL THREE match → same product → add quantity to the parent SKU row
-     - If ANY ONE of the three does not match → keep as a separate line item
-     - If null-SKU row has no description or description is too vague to evaluate → keep separate, set status to "Needs Review", note "Description insufficient for consolidation"
-
-3.⁠ ⁠For rows where both SKU and description are null → keep as separate line item, flag as "Needs Review", note "Line item unreadable"
-
-4.⁠ ⁠After consolidation, each unique SKU appears ONCE with total summed quantity.
-
-5.⁠ ⁠If quantity is null or blank for any row → treat quantity as "?" and do not add to totals.
-
-6.⁠ ⁠For pricing, record the unit price per line item after consolidation. Do NOT sum prices.
-
-### Example:
-Raw JSON input:
-
-[
-  {"line_num":1,"sku":"2256104","description":"SolarWinds Observability A250","quantity":1,"unit":"license","unit_price":500},
-  {"line_num":2,"sku":null,"description":"SolarWinds Observability A250","quantity":1,"unit":null,"unit_price":500},
-  {"line_num":3,"sku":null,"description":"SolarWinds Observability A250","quantity":1,"unit":null,"unit_price":500}
-]
-
-After consolidation:
-SKU=2256104, Description="SolarWinds Observability A250", Total Qty=3, Unit Price=500 (unchanged)
-
----
-
-## STEP 2 — COMPARE CONSOLIDATED TOTALS ACROSS ALL THREE DOCUMENTS
-
-### Description Matching Rules:
-
-Apply these rules in order. Use ONLY these exact status strings — no other values permitted:
-"Match" | "Needs Review" | "Mismatch"
-
-Rule 1 — Formatting differences only → "Match"
-The following differences do NOT change the status from Match:
-•⁠  ⁠Capitalization differences (FORTIGATE vs FortiGate)
-•⁠  ⁠Punctuation differences (FortiGate-100F vs FortiGate 100F)
-•⁠  ⁠Spacing differences
-•⁠  ⁠Common abbreviations (Ent = Enterprise, Std = Standard, HW = Hardware, SW = Software)
-•⁠  ⁠Term/period format differences using ONLY these equivalences:
-    Y1 = 1YR = 12M = 12MO = Annual = 1Year = One Year = 1-Year
-    Y2 = 2YR = 24M = 24MO = 2Year = Two Year = 2-Year
-    Y3 = 3YR = 36M = 36MO = 3Year = Three Year = 3-Year
-  If a term suffix appears that is NOT in the above list, set status to "Needs Review"
-
-Rule 2 — Ambiguous differences → "Needs Review"
-Use this status when:
-•⁠  ⁠Descriptions share the same product name but differ in tier, size, or license level
-•⁠  ⁠One document bundles items that another lists separately
-•⁠  ⁠Term or period cannot be confirmed equivalent using the list above
-•⁠  ⁠Unit of measure differs between documents for the same SKU (unless one unit is null)
-•⁠  ⁠Quantity is "?" in one or more documents
-
-Rule 3 — Clear discrepancy → "Mismatch"
-Use this status when:
-•⁠  ⁠A SKU or product exists in one document with NO equivalent in another
-•⁠  ⁠Quantities differ after consolidation and the difference is not explainable by bundling
-•⁠  ⁠Descriptions refer to clearly different products
-
-When writing notes for a Mismatch caused by an absent document, determine the absent document mechanically:
-•⁠  ⁠If zq_qty is null → absent from ZQ
-•⁠  ⁠If vq_qty is null → absent from VQ
-•⁠  ⁠If ppo_qty is null or "-" → absent from Partner PO
-Always write: "Item present in [X] and [Y] but absent from [Z]" where Z is the document with null quantity. Never reverse this.
-Rule 4 — SKU discrepancy between documents → "Needs Review"
-If the same product is matched by description but carries a different SKU
-in one or more documents (e.g. CS.INSIGHTB.SOLN vs CS.INSIGHT.SOLN):
-  - Set all status fields to "Needs Review"
-  - Note: "SKU discrepancy: [doc A] uses [SKU1], [doc B] uses [SKU2] — 
-    confirm these are the same product"
-  - Still record and compare quantities and prices as normal
-  - Do NOT flag as Mismatch unless quantities or prices also differ
---
-
-## STEP 3 — PRICE COMPARISON
-
-Two comparisons must be performed per line item.
-
-### Price field mapping:
-
-| Comparison | ZQ field | ZQ currency | External document | External currency |
-|---|---|---|---|---|
-| A — Sell side | ⁠ list_price ⁠ | ⁠ quote_currency ⁠ | Partner PO ⁠ unit_price ⁠ | ⁠ partner_po_currency ⁠ |
-| B — Buy side | ⁠ buy_price ⁠ | ⁠ quote_currency ⁠ | VQ ⁠ unit_price ⁠ | ⁠ vendor_quote_currency ⁠ |
-
----
-
-### Step 3a — Identify currencies
-
-Read the three currency fields from ZQ:
-•⁠  ⁠⁠ quote_currency ⁠ — applies to both ⁠ list_price ⁠ and ⁠ buy_price ⁠ in ZQ
-•⁠  ⁠⁠ partner_po_currency ⁠ — currency of Partner PO unit prices
-•⁠  ⁠⁠ vendor_quote_currency ⁠ — currency of VQ unit prices
-
----
-
-### Step 3b — Apply conversion direction
-
-*Comparison A — Sell side (List Price vs. Partner PO)*
-The ZQ list price is the reference. Convert the Partner PO price INTO ⁠ quote_currency ⁠, then compare.
-
-•⁠  ⁠If ⁠ partner_po_currency ⁠ = ⁠ quote_currency ⁠ → no conversion needed; compare directly
-•⁠  ⁠If currencies differ → convert Partner PO price to ⁠ quote_currency ⁠ using the rates below, then compare to ZQ ⁠ list_price ⁠
-
-*Comparison B — Buy side (Buy Price vs. Vendor Quote)*
-The VQ is the reference. Convert the ZQ buy price INTO ⁠ vendor_quote_currency ⁠, then compare.
-
-•⁠  ⁠If ⁠ vendor_quote_currency ⁠ = ⁠ quote_currency ⁠ → no conversion needed; compare directly
-•⁠  ⁠If currencies differ → convert ZQ ⁠ buy_price ⁠ to ⁠ vendor_quote_currency ⁠ using the rates below, then compare to VQ ⁠ unit_price ⁠
-
-*Example:* ZQ buy price = AED 90, VQ currency = USD
-→ Convert: 90 ÷ 3.6725 = USD 24.51
-→ Compare USD 24.51 to VQ unit price
-→ If VQ unit price = USD 24.51 → "Price Match"
-
----
-
-### Step 3c — Fixed exchange rates
-
-| From | To | Operation |
-|------|----|-----------|
-| USD | AED | × 3.6725 |
-| USD | SAR | × 3.7500 |
-| USD | QAR | × 3.6500 |
-| AED | USD | ÷ 3.6725 |
-| SAR | USD | ÷ 3.7500 |
-| QAR | USD | ÷ 3.6500 |
-
-For cross-rates not listed above (e.g. AED to SAR):
-Convert source currency → USD first, then USD → target currency.
-
-Always record:
-•⁠  The original price in its source currency
-•⁠  c⁠The converted price in the target currency
-•⁠  ⁠The exchange rate and operation applied
-
----
-
-### Step 3d — Compare and assign price status
-
-Round all converted values to 2 decimal places before comparing.
-A tolerance of ±0.50 in the comparison currency is permitted to absorb rounding differences.
-
-Use ONLY these exact strings for price status:
-"Price Match" | "Price Mismatch" | "Price Needs Review"
-
-•⁠  ⁠If prices are within ±0.50 of each other → "Price Match"
-•⁠  ⁠If prices differ by more than ±0.50 → "Price Mismatch"
-•⁠  ⁠If unit price is null or missing in any document → "Price Needs Review", note "Price missing in [document name]"
-•⁠  ⁠If currency is not one of USD, AED, SAR, QAR → "Price Needs Review", note "Unsupported currency: [currency code]"
-
----
-
-## STEP 4 — DETERMINE FINAL CALL
-
-Apply these rules in strict order — do not use judgement, apply mechanically:
-
-Rule 1: If ANY item has ANY status field = "Mismatch" OR any price status = "Price Mismatch"
-         → final_call = "ON HOLD — MISMATCH"
-
-Rule 2: If no Mismatch exists but ANY item has ANY status field = "Needs Review" OR any price status = "Price Needs Review"
-         → final_call = "QUERY TO SP"
-
-Rule 3: If ALL status fields across ALL items = "Match" AND all price statuses = "Price Match"
-         → final_call = "CLEAR TO PROCESS"
-
-No exceptions. No other final_call values are permitted.
-
----
-
-## OUTPUT FORMAT
-
-Return ONLY a valid JSON object. No explanation, no markdown, no backticks.
-Use ONLY these exact strings for all status fields: "Match" | "Needs Review" | "Mismatch"
-Use ONLY these exact strings for all price status fields: "Price Match" | "Price Mismatch" | "Price Needs Review"
-
-{
-  "currencies_detected": {
-    "quote_currency": "currency code from ZQ",
-    "partner_po_currency": "currency code from Partner PO",
-    "vendor_quote_currency": "currency code from VQ"
-    "notes":" A 2 to 3 line description of what exchange rates were used for conversion and comparison  with an example in case there is a conversion required otherwise no description needed"
-  },
-  "matching_table": [
-    {
-      "num": 1,
-      "sku": "consolidated SKU — use ZQ SKU if available, else VQ, else Partner PO",
-      "description": "consolidated description",
-
-      "zq_qty": "quantity from ZQ after consolidation, or null if not present",
-      "zq_status": "Match|Needs Review|Mismatch",
-
-      "vq_qty": "quantity from VQ after consolidation, or null if not present",
-      "vq_status": "Match|Needs Review|Mismatch",
-
-      "ppo_qty": "quantity from Partner PO after consolidation, or null if not present",
-      "ppo_status": "Match|Needs Review|Mismatch",
-
-      "list_price_zq": "list price from ZQ in quote_currency, or null",
-      "partner_ppo_price_original": "unit price from Partner PO in partner_po_currency, or null",
-      "partner_ppo_price_converted": "partner_po_price converted to quote_currency, or null if no conversion needed",
-      "list_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review",
-
-      "buy_price_zq": "buy price from ZQ in quote_currency, or null",
-      "buy_price_zq_converted": "buy_price_zq converted to vendor_quote_currency, or null if no conversion needed",
-      "vendor_quote_price": "unit price from VQ in vendor_quote_currency, or null",
-      "buy_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review",
-
-      "exchange_rate_used": "e.g. '1 USD = 3.6725 AED' or 'AED ÷ 3.6725 = USD' or null if no conversion needed",
-      "notes": "specific reason for any non-Match or non-Price Match status, or null if all match"
-    }
-  ],
-  "unmatched_items": [
-      "List each item that is missing from one or more documents. Format: [ABSENT FROM: {document name}] SKU/Description — present in {other documents}. Example: [ABSENT FROM: Partner PO] GIB-DRP-L-WEB-BRANCH-1 — present in ZQ and VQ"
-      "Small description of why price mismatch"
-    ],
-  "needs_review": [
-    "List each item flagged Needs Review or Price Needs Review. Format: SKU/Description — specific reason"
-  ],
-  "must_resolve": [
-    "List each item blocking processing. Format: SKU/Description — specific action required to resolve"
-  ],
-  "overall_summary": "X of Y items Match. Z items Mismatch. W items Needs Review. A items Price Mismatch. B items Price Needs Review.",
-  "final_call": "CLEAR TO PROCESS|QUERY TO SP|ON HOLD — MISMATCH",
-  "final_call_detail": [
-    "One line per blocking or review item explaining exactly what needs to be resolved before processing"
-  ]
-}
- ⁠
-
----
-
-## FIELD DEFINITIONS
-
-currencies_detected          — the three currency codes read from ZQ; drives all conversion logic
-matching_table               — one row per unique consolidated SKU/product across all three documents
-unmatched_items              — items present in only one document, no equivalent found in others
-needs_review                 — items with ambiguity in description, quantity, or price that cannot be auto-resolved
-must_resolve                 — any item that prevents final_call from being CLEAR TO PROCESS
-overall_summary              — always use the exact format shown above
-final_call                   — determined mechanically by Step 4 rules only
-final_call_detail            — empty array [] if final_call is CLEAR TO PROCESS
-buy_price_zq_converted       — ZQ buy price expressed in vendor_quote_currency; this is what gets compared to VQ unit price
-partner_po_price_converted   — Partner PO price expressed in quote_currency; this is what gets compared to ZQ list price
-
-"""
+MATCHING_PROMPT =  load_prompt("claude_matching_prompt.txt")
 
 
 # ─────────────────────────────────────────────
@@ -982,12 +706,12 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
 
         if is_cancelled(job_id): return
         gemini_model = get_gemini_model()
-
+        gemini_prompt = load_prompt("gemini_extraction_prompt.txt")
         # Gemini extractions in parallel
         print(f"[{job_id}] 🔍 Gemini extraction (parallel)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_ppo = executor.submit(extract_pdf_gemini, ppo_bytes, "Partner PO PDF", gemini_model, job_id)
-            future_vq = executor.submit(extract_pdf_gemini, vq_bytes, "VQ PDF", gemini_model, job_id)
+            future_ppo = executor.submit(extract_pdf_gemini, ppo_bytes, "Partner PO PDF", gemini_model, job_id,gemini_prompt)
+            future_vq = executor.submit(extract_pdf_gemini, vq_bytes, "VQ PDF", gemini_model, job_id,gemini_prompt)
 
             while not (future_ppo.done() and future_vq.done()):
                 time.sleep(1)
