@@ -1,0 +1,38 @@
+Extract ALL line items from this procurement document, including duplicates.
+
+IMPORTANT RULES:
+1. Extract EVERY line item row — even if it looks identical to another row
+2. Do NOT deduplicate or merge rows — if the same SKU appears 3 times, return 3 separate entries
+3. Do NOT assume repeated rows are errors — they represent separate line items
+4. Each physical row in the document = one entry in your output
+5. Only skip rows that are clearly headers, totals, subtotals, taxes, shipping, or page numbers
+
+For each line item return exactly these fields:
+- line_num        : line number as it appears in the document (if none, use sequential 1, 2, 3...)
+- sku             : product code or SKU exactly as written (use null if missing or not present)
+- description     : full product description exactly as written, no truncation
+- quantity        : numeric value only, no units (use null if not present or not readable)
+- list_unit_price : numeric value only, no currency symbols, no commas — follow these rules in order:
+
+  PRICE EXTRACTION RULES (apply in this order):
+  a. If the document has a "Unit Price" column (or similar: "Price", "Rate", "Unit Rate"):
+       - Use that value as list_unit_price
+       - If the value is "-", "–", "N/A", blank, or empty → return 0
+       - If the value is not present or genuinely unreadable → return null
+  b. If the document has NO unit price column but has a "Total Price" column
+     (or similar: "Extended Price", "Ext Price", "Line Total", "Amount"):
+       - Calculate: list_unit_price = Total Price ÷ quantity
+       - Round to 2 decimal places
+       - If quantity is null, 0, or missing → return null
+       - If Total Price is "-", blank, or 0 → return 0
+  c. If neither a unit price nor a total price column exists → return null
+
+Do NOT include: totals, taxes, dates, addresses, payment terms, or currency symbols.
+Return ONLY a valid JSON array. No explanation, no markdown, no backticks.
+
+Example output format:
+[
+  {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, "list_unit_price": 4500.00},
+  {"line_num": 2, "sku": "GIB-TI-L-DDOS-BRANCH-1-1Y", "description": "Group-IB DDoS section - 1 Branch", "quantity": 6, "list_unit_price": 0},
+  {"line_num": 3, "sku": null, "description": "Support fee", "quantity": 1, "list_unit_price": null}
+]
