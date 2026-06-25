@@ -2,7 +2,6 @@ import anthropic
 import requests
 import uuid
 import json
-import io
 import re
 import base64
 from datetime import datetime
@@ -15,34 +14,9 @@ import concurrent.futures
 import threading
 import os
 from dotenv import load_dotenv
-from google.cloud import storage as gcs
+
 app = FastAPI()
-PROMPT_BUCKET = os.environ.get("PROMPT_BUCKET", "sku-auditor-prompts")
-_PROMPT_CACHE_TTL = 300  # seconds — change to 60 for faster iteration during testing
 
-_prompt_cache: dict = {}
-
-def load_prompt(filename: str) -> str:
-    """Load a prompt from GCS. Cached for PROMPT_CACHE_TTL seconds."""
-    now = time.time()
-    if filename in _prompt_cache:
-        text, fetched_at = _prompt_cache[filename]
-        if now - fetched_at < _PROMPT_CACHE_TTL:
-            return text
-    try:
-        client = gcs.Client()
-        blob   = client.bucket(PROMPT_BUCKET).blob(filename)
-        text   = blob.download_as_text(encoding="utf-8")
-        _prompt_cache[filename] = (text, now)
-        print(f"[prompts] Loaded {filename} from GCS ({len(text)} chars)")
-        return text
-    except Exception as e:
-        print(f"[prompts] ⚠️ Failed to load {filename} from GCS: {e}")
-        # Fall back to cached version if available, even if stale
-        if filename in _prompt_cache:
-            print(f"[prompts] Using stale cached version of {filename}")
-            return _prompt_cache[filename][0]
-        raise RuntimeError(f"Could not load prompt '{filename}' and no cache available") from e
 # ─────────────────────────────────────────────
 # WEASYPRINT WARMUP
 # Pre-loads fonts at startup so first PDF is fast
@@ -69,9 +43,10 @@ REFRESH_TOKEN  = os.environ["REFRESH_TOKEN"]
 ZOHO_BASE_URL  = os.environ.get("ZOHO_BASE_URL", "https://www.zohoapis.com")
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-PPO_PDF_FIELD   = os.environ.get("PPO_PDF_FIELD", "PPO_PDF_FIELD")
-VQ_PDF_FIELD   = os.environ.get("VQ_PDF_FIELD", "VQ_PDF")
-ACCESS_TOKEN_URL  = os.environ.get("ACCESS_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
+PPO_PDF_FIELD        = os.environ.get("PPO_PDF_FIELD", "PPO_PDF_FIELD")
+VQ_PDF_FIELD         = os.environ.get("VQ_PDF_FIELD", "VQ_PDF")
+ACCESS_TOKEN_URL     = os.environ.get("ACCESS_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
+
 # ─────────────────────────────────────────────
 # IN-MEMORY STORES
 # ─────────────────────────────────────────────
@@ -85,6 +60,95 @@ _gemini_model_cache = None
 
 # OPT 3: Zoho token cache — reuse for 55 min instead of fetching every job
 _token_cache = {"token": None, "expires_at": 0}
+
+# ─────────────────────────────────────────────
+# PROMPT LOADER — reads from Zoho CRM AIPrompts module, 5-min cache
+#
+# Module API name : AIPrompts
+# Field API names : GEMINI_PROMPT  (multiline text)
+#                   CLAUDE_PROMPT  (multiline text)
+#
+# The loader fetches the first record from AIPrompts, extracts both field
+# values in a single CRM call, and caches them for _PROMPT_CACHE_TTL seconds.
+# Falls back to stale cache if CRM is unreachable.
+# ─────────────────────────────────────────────
+_PROMPT_CACHE_TTL = 300          # seconds — lower to 60 during active prompt tuning
+_crm_prompt_cache: dict = {      # keys: "gemini" | "claude"
+    "gemini": (None, 0),
+    "claude": (None, 0),
+}
+
+def _fetch_prompts_from_crm() -> tuple[str, str]:
+    """Fetch GEMINI_PROMPT and CLAUDE_PROMPT from the Zoho CRM AIPrompts module.
+    Returns (gemini_prompt, claude_prompt).
+    Raises RuntimeError if the module is empty or fields are blank."""
+    token = get_access_token()
+    url   = f"{ZOHO_BASE_URL}/crm/v3/AIPrompts"
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    params  = {"fields": "GEMINI_PROMPT,CLAUDE_PROMPT", "per_page": 1}
+
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    print(f"[prompts] AIPrompts CRM fetch status: {r.status_code}")
+    r.raise_for_status()
+
+    data = r.json().get("data", [])
+    if not data:
+        raise RuntimeError(
+            "AIPrompts module is empty — please create a record with "
+            "GEMINI_PROMPT and CLAUDE_PROMPT field values."
+        )
+
+    record = data[0]
+    gemini_prompt = (record.get("GEMINI_PROMPT") or "").strip()
+    claude_prompt = (record.get("CLAUDE_PROMPT") or "").strip()
+
+    if not gemini_prompt:
+        raise RuntimeError("GEMINI_PROMPT field in AIPrompts CRM record is blank.")
+    if not claude_prompt:
+        raise RuntimeError("CLAUDE_PROMPT field in AIPrompts CRM record is blank.")
+
+    print(f"[prompts] Loaded from CRM AIPrompts — "
+          f"Gemini: {len(gemini_prompt)} chars, Claude: {len(claude_prompt)} chars")
+    return gemini_prompt, claude_prompt
+
+
+def load_gemini_prompt() -> str:
+    """Return the Gemini extraction prompt, using the 5-min cache."""
+    now  = time.time()
+    text, fetched_at = _crm_prompt_cache["gemini"]
+    if text and (now - fetched_at) < _PROMPT_CACHE_TTL:
+        return text
+    return _refresh_prompt_cache()[0]
+
+
+def load_claude_prompt() -> str:
+    """Return the Claude matching prompt, using the 5-min cache."""
+    now  = time.time()
+    text, fetched_at = _crm_prompt_cache["claude"]
+    if text and (now - fetched_at) < _PROMPT_CACHE_TTL:
+        return text
+    return _refresh_prompt_cache()[1]
+
+
+def _refresh_prompt_cache() -> tuple[str, str]:
+    """Fetch both prompts from CRM, update the cache, and return (gemini, claude).
+    Falls back to stale cache values if CRM is unreachable."""
+    now = time.time()
+    try:
+        gemini_prompt, claude_prompt = _fetch_prompts_from_crm()
+        _crm_prompt_cache["gemini"] = (gemini_prompt, now)
+        _crm_prompt_cache["claude"] = (claude_prompt, now)
+        return gemini_prompt, claude_prompt
+    except Exception as e:
+        print(f"[prompts] ⚠️  CRM fetch failed: {e}")
+        gemini_text, _ = _crm_prompt_cache["gemini"]
+        claude_text, _ = _crm_prompt_cache["claude"]
+        if gemini_text and claude_text:
+            print("[prompts] Using stale cached prompts")
+            return gemini_text, claude_text
+        raise RuntimeError(
+            "Could not load prompts from CRM AIPrompts module and no cache available."
+        ) from e
 
 
 # ─────────────────────────────────────────────
@@ -310,7 +374,7 @@ def get_gemini_model() -> str:
 #    OPT 1: Returns compact JSON string
 #    (fewer tokens to Claude vs verbose text)
 # ─────────────────────────────────────────────
-def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None, prompt: str= None) -> str:
+def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None, prompt: str = "") -> str:
     if job_id and is_cancelled(job_id):
         print(f"🔍 Cancelled before {label} extraction")
         raise Exception("Job cancelled by user")
@@ -320,11 +384,9 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: st
         generation_config={"temperature": 0, "response_mime_type": "application/json"}
     )
 
-    gemini_prompt = prompt
-
     print(f"🔍 Extracting {label} via Gemini ({model_name})...")
     response = model.generate_content(
-        [{"mime_type": "application/pdf", "data": pdf_bytes}, gemini_prompt],
+        [{"mime_type": "application/pdf", "data": pdf_bytes}, prompt],
         request_options={"timeout": 120}
     )
 
@@ -348,23 +410,19 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: st
 
 
 # ─────────────────────────────────────────────
-# 9. MATCHING PROMPT
-# ─────────────────────────────────────────────
-MATCHING_PROMPT =  load_prompt("claude_matching_prompt.txt")
-
-
-# ─────────────────────────────────────────────
 # 10. CLAUDE COMPARISON
 #     OPT 2: Auto model selection based on size
 #     OPT 1: Receives compact JSON (fewer tokens)
 # ─────────────────────────────────────────────
+
 def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, job_id: str = None) -> dict:
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
     # Always use Sonnet with temperature=0 for consistency
-    model_name = "claude-sonnet-4-6"
-    max_tokens = 32000
+    model_name    = "claude-sonnet-4-6"
+    max_tokens    = 32000
+    matching_prompt = load_claude_prompt()
     print(f"Streaming from Claude ({model_name})...")
 
     client    = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -379,8 +437,8 @@ def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, job_id: str = No
             "content": [
                 {"type": "text", "text": "## ZOHO QUOTE (ZQ):\n\n" + zoho_text + "\n\n---"},
                 {"type": "text", "text": "## VENDOR QUOTE (VQ) JSON:\n\n" + vq_text + "\n\n---"},
-                {"type": "text", "text": "## ⁠Partner PO (PO):\n\n" + ppo_text + "\n\n---"},
-                {"type": "text", "text": MATCHING_PROMPT}
+                {"type": "text", "text": "## Partner PO (PO):\n\n" + ppo_text + "\n\n---"},
+                {"type": "text", "text": matching_prompt}
             ]
         }]
     ) as stream:
@@ -395,7 +453,7 @@ def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, job_id: str = No
 
     if message.stop_reason == "max_tokens":
         raise Exception("Claude truncated — increase max_tokens")
-    print("CLAUDE RESPONSE:{full_text}")
+    print(f"CLAUDE RESPONSE: {full_text}")
     clean = full_text.replace("```json", "").replace("```", "").strip()
     return json.loads(clean)
 
@@ -458,25 +516,27 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
     for i, r in enumerate(result.get("matching_table", [])):
         row_bg = "#ffffff" if i % 2 == 0 else "#f9fafb"
         table_rows += f"""<tr style="background:{row_bg}">
-            <td style="text-align:center;font-weight:600">{r.get("num","")}</td>
-            <td style="font-family:monospace;font-size:9px;color:#374151;word-break:break-all">{r.get("sku","") or "None"}</td>
-            <td style="text-align:center">{r.get("ppo_qty","") or "-"}</td>
-            <td style="text-align:center;font-weight:600">{r.get("zq_qty","") or "-"}</td>
+            <td style="text-align:center;font-weight:600">{r.get("num") or ""}</td>
+            <td style="font-family:monospace;font-size:9px;color:#374151;word-break:break-all">{r.get("sku") or ""}</td>
+            <td style="text-align:center">{r.get("ppo_qty") or "-"}</td>
+            <td style="text-align:center;font-weight:600">{r.get("zq_qty") or "-"}</td>
             <td style="text-align:center">{status_badge(r.get("zq_status"))}</td>
-            <td style="text-align:center;font-weight:600">{r.get("vq_qty","") or "-"}</td>
+            <td style="text-align:center;font-weight:600">{r.get("vq_qty") or "-"}</td>
             <td style="text-align:center">{status_badge(r.get("ppo_status"))}</td>
             <td style="text-align:center">{status_badge(r.get("vq_status"))}</td>
             <td style="text-align:center">{status_badge(r.get("list_price_comparison_status"))}</td>
             <td style="text-align:center">{status_badge(r.get("buy_price_comparison_status"))}</td>
-            <td style="font-size:9px;color:#6b7280;line-height:1.4">{r.get("notes","")}</td>
+            <td style="font-size:9px;color:#6b7280;line-height:1.4">{r.get("notes") or ""}</td>
         </tr>"""
 
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
-    must_resolve = "".join([f'<li class="item-red">{i}</li>' for i in (result.get("must_resolve") or [])]) or "<li>None</li>"
-    needs_review = "".join([f'<li class="item-amber">{i}</li>' for i in (result.get("needs_review") or [])]) or "<li>None</li>"
-    unmatched    = "".join([f'<span class="tag">{i}</span>' for i in (result.get("unmatched_items") or [])])
+    must_resolve = "".join([f'<li class="item-red">{i}</li>'   for i in (result.get("must_resolve") or [])]) \
+                   or '<li style="color:#6b7280;font-style:italic">None — all items cleared</li>'
+    needs_review = "".join([f'<li class="item-amber">{i}</li>' for i in (result.get("needs_review") or [])]) \
+                   or '<li style="color:#6b7280;font-style:italic">None — no items flagged for review</li>'
+    unmatched    = "".join([f'<span class="tag">{i}</span>'    for i in (result.get("unmatched_items") or [])])
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     by_line      = f" &nbsp;|&nbsp; Initiated by: {initiated_by}" if initiated_by else ""
 
@@ -543,7 +603,7 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
   {currency_block}
   <div class="banner">
     <div class="banner-title">{result.get("final_call","")}</div>
-   <!-- <ul>{fc_details}</ul> -->
+    <ul>{fc_details}</ul>
   </div>
   <div class="card">
     <div class="card-title">Section 1 - Three-Way Item Matching</div>
@@ -706,12 +766,15 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
 
         if is_cancelled(job_id): return
         gemini_model = get_gemini_model()
-        gemini_prompt = load_prompt("gemini_extraction_prompt.txt")
+
+        # Load extraction prompt once — shared by both parallel PDF extractions
+        gemini_prompt = load_gemini_prompt()
+
         # Gemini extractions in parallel
         print(f"[{job_id}] 🔍 Gemini extraction (parallel)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_ppo = executor.submit(extract_pdf_gemini, ppo_bytes, "Partner PO PDF", gemini_model, job_id,gemini_prompt)
-            future_vq = executor.submit(extract_pdf_gemini, vq_bytes, "VQ PDF", gemini_model, job_id,gemini_prompt)
+            future_ppo = executor.submit(extract_pdf_gemini, ppo_bytes, "Partner PO PDF", gemini_model, job_id, gemini_prompt)
+            future_vq  = executor.submit(extract_pdf_gemini, vq_bytes,  "VQ PDF",         gemini_model, job_id, gemini_prompt)
 
             while not (future_ppo.done() and future_vq.done()):
                 time.sleep(1)
