@@ -7,4 +7,3 @@ google-generativeai
 weasyprint
 python-dotenv
 uvicorn
-google-cloud-storage
