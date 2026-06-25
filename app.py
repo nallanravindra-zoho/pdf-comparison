@@ -78,6 +78,25 @@ _crm_prompt_cache: dict = {      # keys: "gemini" | "claude"
     "claude": (None, 0),
 }
 
+def _sanitise_prompt(text: str) -> str:
+    """Strip invisible/problematic unicode characters that CRM editors silently
+    inject (BOM U+FEFF, word-joiner U+2060, zero-width space U+200B, etc.).
+    These cause JSONDecodeError when they leak into Claude's output."""
+    INVISIBLE = (
+        "\ufeff",   # BOM
+        "\u2060",   # word joiner
+        "\u200b",   # zero-width space
+        "\u200c",   # zero-width non-joiner
+        "\u200d",   # zero-width joiner
+        "\u00a0",   # non-breaking space → replace with regular space
+        "\u2028",   # line separator
+        "\u2029",   # paragraph separator
+    )
+    for ch in INVISIBLE:
+        text = text.replace(ch, " " if ch == "\u00a0" else "")
+    return text.strip()
+
+
 def _fetch_prompts_from_crm() -> tuple[str, str]:
     """Fetch GEMINI_PROMPT and CLAUDE_PROMPT from the Zoho CRM AIPrompts module.
     Returns (gemini_prompt, claude_prompt).
@@ -99,8 +118,8 @@ def _fetch_prompts_from_crm() -> tuple[str, str]:
         )
 
     record = data[0]
-    gemini_prompt = (record.get("GEMINI_PROMPT") or "").strip()
-    claude_prompt = (record.get("CLAUDE_PROMPT") or "").strip()
+    gemini_prompt = _sanitise_prompt(record.get("GEMINI_PROMPT") or "")
+    claude_prompt = _sanitise_prompt(record.get("CLAUDE_PROMPT") or "")
 
     if not gemini_prompt:
         raise RuntimeError("GEMINI_PROMPT field in AIPrompts CRM record is blank.")
@@ -423,6 +442,9 @@ def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, job_id: str = No
     model_name    = "claude-sonnet-4-6"
     max_tokens    = 32000
     matching_prompt = load_claude_prompt()
+    print(f"[claude] Prompt length: {len(matching_prompt)} chars")
+    print(f"[claude] Prompt start: {repr(matching_prompt[:80])}")
+    print(f"[claude] Prompt end:   {repr(matching_prompt[-80:])}")
     print(f"Streaming from Claude ({model_name})...")
 
     client    = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -448,14 +470,32 @@ def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, job_id: str = No
                 print(f"[{job_id}] Cancelled during Claude streaming")
                 raise Exception("Job cancelled during Claude streaming")
 
-    message = stream.get_final_message()
-    print(f"Claude response: {len(full_text)} chars | Stop: {message.stop_reason}")
+        # get_final_message() MUST stay inside the with block.
+        # The SDK tears down the stream on context exit — calling it
+        # outside returns an empty/incomplete object in newer SDK versions.
+        message = stream.get_final_message()
+        stop_reason = message.stop_reason
+        print(f"Claude response: {len(full_text)} chars | Stop: {stop_reason}")
 
-    if message.stop_reason == "max_tokens":
-        raise Exception("Claude truncated — increase max_tokens")
-    print(f"CLAUDE RESPONSE: {full_text}")
-    clean = full_text.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean)
+        if stop_reason == "max_tokens":
+            raise Exception("Claude truncated — increase max_tokens")
+
+        print(f"CLAUDE RESPONSE: {full_text}")
+
+        # Strip markdown fences then extract the outermost JSON object.
+        # Using regex instead of bare json.loads so any stray leading character
+        # (BOM, word-joiner, prose preamble) cannot cause a char-0 parse failure.
+        clean = full_text.replace("```json", "").replace("```", "").strip()
+        json_match = re.search(r'\{.*\}', clean, re.DOTALL)
+        if not json_match:
+            print(f"[claude] FULL RAW RESPONSE:\n{full_text}")
+            raise Exception(
+                f"No JSON object found in Claude response. "
+                f"stop_reason={stop_reason}, "
+                f"full_text_len={len(full_text)}, "
+                f"raw_repr={repr(full_text[:300])}"
+            )
+        return json.loads(json_match.group())
 
 
 # ─────────────────────────────────────────────
