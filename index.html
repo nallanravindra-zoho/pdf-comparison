@@ -472,8 +472,12 @@ function pollJobStatus(jobId, quoteId, attempt) {
         render(parsed.result, parsed.generated_at,parsed.quote_ref);
       } else if (parsed.status === "error") {
         showError("Server error: " + (parsed.error || "Unknown error"));
+      } else if (parsed.status === "cancelled") {
+        showError("The job was cancelled — the widget was closed or timed out waiting for a response. Please try again.");
+      } else if (parsed.status === "not_found") {
+        showError("Job not found on the server. The server may have restarted mid-job. Please try again.");
       } else {
-        // Show current phase from server
+        // Still processing — show current phase from server
         var serverPhase = parsed.phase || "Processing...";
         showLoading(serverPhase);
         pollTimer = setTimeout(function() {

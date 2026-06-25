@@ -675,6 +675,10 @@ def auto_cancel_watcher(job_id: str, timeout_seconds: int = 6):
 def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
     try:
         jobs[job_id] = {"status": "processing", "phase": "Initialising..."}
+        # Reset the watcher clock to now — the 6s abandonment window starts
+        # from when the job actually begins, not from when /analyze-quote
+        # responded (which can be 5-10s earlier through the Zoho SDK proxy).
+        last_poll[job_id] = time.time()
         t0 = time.time()
 
         if is_cancelled(job_id): return
@@ -840,14 +844,14 @@ def analyze_quote(payload: dict, background_tasks: BackgroundTasks):
         return JSONResponse(status_code=400, content={"error": "quote_id missing"})
 
     job_id            = str(uuid.uuid4())
-    jobs[job_id]      = {"status": "processing"}
+    jobs[job_id]      = {"status": "processing", "phase": "Fetching quote from Zoho..."}
     last_poll[job_id] = time.time()
 
     background_tasks.add_task(process_quote_job, job_id, quote_id, initiated_by)
 
     threading.Thread(
         target=auto_cancel_watcher,
-        args=(job_id, 6),
+        args=(job_id, 6),   # 6s — if widget closes, cancel within one watcher cycle
         daemon=True
     ).start()
 
