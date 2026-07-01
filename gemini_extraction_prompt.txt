@@ -1,4 +1,45 @@
 Extract ALL line items from this procurement document, including duplicates.
+Also extract key header/reference fields from the document as described below.
+
+============================
+SECTION A — HEADER FIELDS
+============================
+
+Depending on which document type this is, extract the following header fields.
+These appear in the document header, cover page, footer, letterhead, or as part of a logo/stamp.
+
+For a PARTNER PO document (purchase order from a partner/reseller to Cyberknight):
+  - reseller_name     : The name of the company that issued this PO (the buyer / partner / reseller).
+                        Look first in text (company name, "From:", "Issued by:", letterhead, footer).
+                        If not found in text, look in any logo or image at the top of the document
+                        and read the company name from the logo.
+                        Return null if genuinely not found.
+  - partner_po_ref    : The PO number / purchase order reference.
+                        Look for headers like "Purchase Order", "PO Number", "PO #", "Order Number",
+                        "Order Ref", "Reference". Return the value exactly as printed (e.g. "PO-2024-00123").
+                        Return null if not found.
+
+For a VENDOR QUOTE document (quote from a vendor to Cyberknight):
+  - vendor_name       : The name of the vendor/supplier company that issued this quote.
+                        Look first in text (company name, letterhead, "From:", "Prepared by:", footer).
+                        If not found in text, look in any logo or image at the top of the document
+                        and read the company name from the logo.
+                        Return null if genuinely not found.
+  - vendor_quote_ref  : The vendor's quote reference number.
+                        Look for headers like "Quote Reference", "Quote Number", "Quote #",
+                        "Quotation Number", "Quotation Ref", "Ref No", "Reference Number".
+                        Return the value exactly as printed (e.g. "QT-2024-98765").
+                        Return null if not found.
+
+IMPORTANT — for logo/image extraction:
+  - Gemini can read text embedded in images and logos natively.
+  - If the company name only appears as part of a logo image (not as plain text), still extract it.
+  - Return the extracted name as a plain string (no formatting).
+  - If you are uncertain about the name read from a logo, still return your best reading — do not return null just because it was extracted from an image.
+
+============================
+SECTION B — LINE ITEMS
+============================
 
 IMPORTANT RULES:
 1. Extract EVERY line item row — even if it looks identical to another row
@@ -28,11 +69,28 @@ For each line item return exactly these fields:
   c. If neither a unit price nor a total price column exists → return null
 
 Do NOT include: totals, taxes, dates, addresses, payment terms, or currency symbols.
-Return ONLY a valid JSON array. No explanation, no markdown, no backticks.
+
+============================
+OUTPUT FORMAT
+============================
+
+Return ONLY a valid JSON object with exactly two keys: "header" and "line_items".
+No explanation, no markdown, no backticks.
+
+The "header" object must contain ALL four keys below regardless of document type —
+set keys not applicable to this document type to null.
 
 Example output format:
-[
-  {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, "list_unit_price": 4500.00},
-  {"line_num": 2, "sku": "GIB-TI-L-DDOS-BRANCH-1-1Y", "description": "Group-IB DDoS section - 1 Branch", "quantity": 6, "list_unit_price": 0},
-  {"line_num": 3, "sku": null, "description": "Support fee", "quantity": 1, "list_unit_price": null}
-]
+{
+  "header": {
+    "reseller_name": "Acme Cybersolutions LLC",
+    "partner_po_ref": "PO-2024-00123",
+    "vendor_name": null,
+    "vendor_quote_ref": null
+  },
+  "line_items": [
+    {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, "list_unit_price": 4500.00},
+    {"line_num": 2, "sku": "GIB-TI-L-DDOS-BRANCH-1-1Y", "description": "Group-IB DDoS section - 1 Branch", "quantity": 6, "list_unit_price": 0},
+    {"line_num": 3, "sku": null, "description": "Support fee", "quantity": 1, "list_unit_price": null}
+  ]
+}
