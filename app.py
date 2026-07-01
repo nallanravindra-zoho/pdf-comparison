@@ -330,29 +330,45 @@ def attach_via_filestore(quote_id, pdf_bytes, token,report_name="SKU_Audit_Repor
 # ─────────────────────────────────────────────
 def format_zoho_quote(quote: dict) -> str:
     lines = []
-    items = quote.get("Quoted_Items", [])
-    print(f"✅ Zoho quote has {items} ")
-    print(f"✅ Zoho quote has {len(items)} line items")
-    for i, item in enumerate(items, 1):
-        sku  = item.get("Product_Name", {}).get("Product_Code", "N/A")
-        desc = item.get("Description", "N/A")
-        qty  = item.get("Quantity", "N/A")
-        quote_currency  = quote.get("Currency", {})
-        Partner_PO_Currency = quote.get("Partner_PO_Currency", "N/A")
-        Vendor_Quote_Currency  = quote.get("Vendor_Quote_Currency", "N/A")
-        Exchange_Rate= quote.get("Exchange_Rate", "N/A")
-        buy_price_zq=item.get("Buy_Price", "N/A")
-        list_price_zq=item.get("List_Price", "N/A")
 
-        lines.append(f"  {i}. SKU         : {sku}")
-        lines.append(f"     Description : {desc}")
-        lines.append(f"     Quantity    : {qty}")
-        lines.append(f"     Quote_Currency         : {quote_currency}")
-        lines.append(f"     Partner_PO_Currency : {Partner_PO_Currency}")
-        lines.append(f"     Vendor_Quote_Currency    : {Vendor_Quote_Currency}")
-        lines.append(f"     Exchange_Rate    : {Exchange_Rate}")
-        lines.append(f"     buy_price_zq   : {buy_price_zq}")
-        lines.append(f"     list_price_zq    : {list_price_zq}")
+    # ── Header / reference fields ─────────────────────────────
+    quote_currency        = quote.get("Currency", {})
+    partner_po_currency   = quote.get("Partner_PO_Currency", "N/A")
+    vendor_quote_currency = quote.get("Vendor_Quote_Currency", "N/A")
+    exchange_rate         = quote.get("Exchange_Rate", "N/A")
+    reseller              = quote.get("Reseller", "N/A")
+    partner_po_ref        = quote.get("Partner_PO_Ref", "N/A")
+    vendor                = quote.get("Vendor", "N/A")
+    vendor_quote_ref      = quote.get("Vendor_Quote_Ref", "N/A")
+
+    lines.append("## QUOTE HEADER")
+    lines.append(f"  Quote_Currency        : {quote_currency}")
+    lines.append(f"  Partner_PO_Currency   : {partner_po_currency}")
+    lines.append(f"  Vendor_Quote_Currency : {vendor_quote_currency}")
+    lines.append(f"  Exchange_Rate         : {exchange_rate}")
+    lines.append(f"  Reseller              : {reseller}")
+    lines.append(f"  Partner_PO_Ref        : {partner_po_ref}")
+    lines.append(f"  Vendor                : {vendor}")
+    lines.append(f"  Vendor_Quote_Ref      : {vendor_quote_ref}")
+    lines.append("")
+
+    # ── Line items ────────────────────────────────────────────
+    items = quote.get("Quoted_Items", [])
+    print(f"✅ Zoho quote has {len(items)} line items")
+    lines.append("## LINE ITEMS")
+    for i, item in enumerate(items, 1):
+        product_name_field = item.get("Product_Name") or {}
+        sku          = product_name_field.get("Product_Code") or product_name_field.get("name") or "N/A"
+        desc         = item.get("Description", "N/A")
+        qty          = item.get("Quantity", "N/A")
+        buy_price_zq = item.get("Buy_Price", "N/A")
+        list_price_zq= item.get("List_Price", "N/A")
+
+        lines.append(f"  {i}. SKU          : {sku}")
+        lines.append(f"     Description  : {desc}")
+        lines.append(f"     Quantity     : {qty}")
+        lines.append(f"     buy_price_zq : {buy_price_zq}")
+        lines.append(f"     list_price_zq: {list_price_zq}")
         lines.append("")
     return "\n".join(lines)
 
@@ -394,6 +410,16 @@ def get_gemini_model() -> str:
 #    (fewer tokens to Claude vs verbose text)
 # ─────────────────────────────────────────────
 def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None, prompt: str = "") -> str:
+    """Extract header fields AND line items from a PDF using Gemini.
+
+    The updated Gemini prompt returns:
+      { "header": { reseller_name, partner_po_ref, vendor_name, vendor_quote_ref },
+        "line_items": [ { line_num, sku, description, quantity, list_unit_price }, ... ] }
+
+    Legacy flat-array responses are still handled gracefully.
+    Returns a formatted text block with HEADER FIELDS and LINE ITEMS sections
+    for Claude to consume.
+    """
     if job_id and is_cancelled(job_id):
         print(f"🔍 Cancelled before {label} extraction")
         raise Exception("Job cancelled by user")
@@ -414,17 +440,47 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: st
 
     try:
         clean = raw.replace("```json", "").replace("```", "").strip()
-        items = json.loads(clean)
-        print(f"✅ Extracted {len(items)} items from {label}")
+        parsed = json.loads(clean)
 
-        # Formatted text — faster for Claude to process than minified JSON
+        # ── Detect new format vs legacy flat array ──────────────
+        if isinstance(parsed, dict) and "line_items" in parsed:
+            # New format: { "header": {...}, "line_items": [...] }
+            header = parsed.get("header") or {}
+            items  = parsed.get("line_items") or []
+        elif isinstance(parsed, list):
+            # Legacy flat array — no header fields available
+            header = {}
+            items  = parsed
+        else:
+            raise ValueError(f"Unexpected Gemini response structure: {type(parsed)}")
+
+        print(f"✅ Extracted {len(items)} items from {label}")
+        print(f"   Header fields: {header}")
+
         lines = [f"## {label}"]
+
+        # Header section — always emit all four keys so Claude has them
+        lines.append("### HEADER FIELDS")
+        lines.append(f"  reseller_name    : {header.get('reseller_name') or 'null'}")
+        lines.append(f"  partner_po_ref   : {header.get('partner_po_ref') or 'null'}")
+        lines.append(f"  vendor_name      : {header.get('vendor_name') or 'null'}")
+        lines.append(f"  vendor_quote_ref : {header.get('vendor_quote_ref') or 'null'}")
+        lines.append("")
+
+        # Line items section
+        lines.append("### LINE ITEMS")
         for item in items:
-            lines.append(f"  {item.get('line_num','')}. SKU: {item.get('sku','N/A')} | Desc: {item.get('description','N/A')} | Qty: {item.get('quantity','N/A')} | list_unit_price: {item.get('list_unit_price','N/A')}")
+            lines.append(
+                f"  {item.get('line_num','')}. SKU: {item.get('sku','N/A')} | "
+                f"Desc: {item.get('description','N/A')} | "
+                f"Qty: {item.get('quantity','N/A')} | "
+                f"list_unit_price: {item.get('list_unit_price','N/A')}"
+            )
+
         return "\n".join(lines)
 
-    except json.JSONDecodeError as e:
-        print(f"⚠️  Gemini JSON parse error: {e}")
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"⚠️  Gemini JSON parse error for {label}: {e}")
         return raw
 
 
@@ -513,13 +569,13 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
         if not status or status == "-":
             return '<span class="pill pill-na">N/A</span>'
         s = status.lower()
-        # Substring matching (checked in this order) so this works for both
-        # qty statuses ("Match"/"Needs Review"/"Mismatch") and price statuses
-        # ("Price Match"/"Price Needs Review"/"Price Mismatch") — "mismatch"
-        # must be checked before "match" since it contains "match" as a substring.
-        if "mismatch" in s: return '<span class="pill pill-miss">Mismatch</span>'
-        if "review" in s:   return '<span class="pill pill-review">Review</span>'
-        if "match" in s:    return '<span class="pill pill-match">Match</span>'
+        # Substring matching (checked in this order) so this works for qty statuses
+        # ("Match"/"Needs Review"/"Mismatch"), price statuses, and header statuses
+        # ("Not Found"). "mismatch" must be checked before "match".
+        if "mismatch"  in s: return '<span class="pill pill-miss">Mismatch</span>'
+        if "not found" in s: return '<span class="pill pill-review">Not Found</span>'
+        if "review"    in s: return '<span class="pill pill-review">Review</span>'
+        if "match"     in s: return '<span class="pill pill-match">Match</span>'
         return f'<span class="pill pill-na">{status}</span>'
 
     fc = (result.get("final_call") or "").upper()
@@ -547,6 +603,51 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
           <div class="currency-item"><span class="currency-tag-label">Vendor Quote</span><span class="currency-tag-value">{vqc}</span></div>
         </div>
         {f'<p class="currency-notes">{currency_notes}</p>' if currency_notes else ""}
+      </div>"""
+
+    # ── Document header validation block ────────────────────────
+    dhv = result.get("document_header_validation") or {}
+
+    def _dhv_row(label, field_data):
+        if not field_data:
+            return ""
+        zq_val  = field_data.get("zq_value") or "—"
+        pdf_val = field_data.get("pdf_value") or "—"
+        status  = field_data.get("status") or "—"
+        note    = field_data.get("note") or ""
+        return (
+            f"<tr>"
+            f"<td style='font-weight:600;font-size:9px'>{label}</td>"
+            f"<td style='font-size:9px;font-family:monospace'>{zq_val}</td>"
+            f"<td style='font-size:9px;font-family:monospace'>{pdf_val}</td>"
+            f"<td style='text-align:center'>{status_badge(status)}</td>"
+            f"<td style='font-size:9px;color:#6b7280'>{note}</td>"
+            f"</tr>"
+        )
+
+    dhv_rows = (
+        _dhv_row("Reseller",        dhv.get("reseller"))
+        + _dhv_row("Partner PO Ref",  dhv.get("partner_po_ref"))
+        + _dhv_row("Vendor",          dhv.get("vendor"))
+        + _dhv_row("Vendor Quote Ref",dhv.get("vendor_quote_ref"))
+    )
+
+    header_validation_block = ""
+    if dhv_rows:
+        header_validation_block = f"""<div class="card">
+        <div class="card-title">Document Header Validation</div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:110px">Field</th>
+              <th style="width:170px">Zoho Quote Value</th>
+              <th style="width:170px">PDF Extracted Value</th>
+              <th style="width:82px;text-align:center">Status</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody>{dhv_rows}</tbody>
+        </table>
       </div>"""
 
     if job_id and is_cancelled(job_id):
@@ -641,9 +742,9 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
     <div class="subtitle">Quote: {quote_subject} &nbsp;|&nbsp; Generated: {generated_at}{by_line}</div>
   </div>
   {currency_block}
+  {header_validation_block}
   <div class="banner">
     <div class="banner-title">{result.get("final_call","")}</div>
-    <ul>{fc_details}</ul>
   </div>
   <div class="card">
     <div class="card-title">Section 1 - Three-Way Item Matching</div>

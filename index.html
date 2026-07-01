@@ -66,6 +66,15 @@
   .pill-miss    { background: #fee2e2; color: #991b1b; }
   .pill-na      { background: #f3f4f6; color: #9ca3af; }
 
+  /* ── HEADER VALIDATION CARD ── */
+  .hv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .hv-table thead th { background: #1a1a2e; color: #fff; padding: 8px 10px; text-align: left; font-weight: 600; font-size: 11px; }
+  .hv-table tbody td { padding: 8px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; line-height: 1.4; }
+  .hv-table tbody tr:hover td { background: #eff6ff; }
+  .hv-field { font-weight: 700; color: #374151; }
+  .hv-val   { font-family: monospace; font-size: 11px; color: #1a1a2e; }
+  .hv-note  { font-size: 11px; color: #6b7280; }
+
   .summary-section { margin-bottom: 12px; }
   .summary-section:last-child { margin-bottom: 0; }
   .summary-label { font-weight: 700; font-size: 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
@@ -500,13 +509,13 @@ function pollJobStatus(jobId, quoteId, attempt) {
 function statusPill(status) {
   if (!status || status === "-") return '<span class="pill pill-na">N/A</span>';
   var s = status.toLowerCase();
-  // Substring matching (checked in this order) so this works for both
-  // qty statuses ("Match"/"Needs Review"/"Mismatch") and price statuses
-  // ("Price Match"/"Price Needs Review"/"Price Mismatch") — "mismatch" must
-  // be checked before "match" since it contains "match" as a substring.
-  if (s.indexOf("mismatch") !== -1) return '<span class="pill pill-miss">&#128308; Mismatch</span>';
-  if (s.indexOf("review")   !== -1) return '<span class="pill pill-review">&#9888; Review</span>';
-  if (s.indexOf("match")    !== -1) return '<span class="pill pill-match">&#10003; Match</span>';
+  // Substring matching (checked in this order) so this works for qty statuses,
+  // price statuses, and header validation statuses ("Not Found").
+  // "mismatch" must be checked before "match" since it contains "match".
+  if (s.indexOf("mismatch")  !== -1) return '<span class="pill pill-miss">&#128308; Mismatch</span>';
+  if (s.indexOf("not found") !== -1) return '<span class="pill pill-review">&#9888; Not Found</span>';
+  if (s.indexOf("review")    !== -1) return '<span class="pill pill-review">&#9888; Review</span>';
+  if (s.indexOf("match")     !== -1) return '<span class="pill pill-match">&#10003; Match</span>';
   return '<span class="pill pill-na">' + status + "</span>";
 }
 
@@ -524,6 +533,44 @@ function currencyCard(data) {
     +   '<div class="currency-item"><span class="currency-tag-label">Vendor Quote</span><span class="currency-tag-value">' + vqc + '</span></div>'
     + '</div>'
     + (notes ? '<p class="currency-notes">' + notes + '</p>' : '')
+    + '</div>';
+}
+
+function headerValidationCard(data) {
+  var dhv = data.document_header_validation;
+  if (!dhv) return '';
+
+  function hvRow(label, field) {
+    if (!field) return '';
+    var zqVal  = field.zq_value  || "—";
+    var pdfVal = field.pdf_value || "—";
+    var status = field.status    || "—";
+    var note   = field.note      || "";
+    return '<tr>'
+      + '<td class="hv-field">' + label  + '</td>'
+      + '<td class="hv-val">'   + zqVal  + '</td>'
+      + '<td class="hv-val">'   + pdfVal + '</td>'
+      + '<td style="text-align:center">' + statusPill(status) + '</td>'
+      + '<td class="hv-note">'  + note   + '</td>'
+      + '</tr>';
+  }
+
+  var rows = hvRow("Reseller",         dhv.reseller)
+           + hvRow("Partner PO Ref",   dhv.partner_po_ref)
+           + hvRow("Vendor",           dhv.vendor)
+           + hvRow("Vendor Quote Ref", dhv.vendor_quote_ref);
+
+  if (!rows) return '';
+
+  return '<div class="card">'
+    + '<h3>&#128196; Document Header Validation</h3>'
+    + '<table class="hv-table"><thead><tr>'
+    + '<th style="width:130px">Field</th>'
+    + '<th>Zoho Quote Value</th>'
+    + '<th>PDF Extracted Value</th>'
+    + '<th style="width:120px;text-align:center">Status</th>'
+    + '<th>Note</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + '</div>';
 }
 
@@ -603,6 +650,7 @@ function render(data, generatedAt,quoteRef) {
     savedBanner
     + quoteHeader
     + currencyCard(data)
+    + headerValidationCard(data)
     + finalCallBanner(data)
     + '<div class="card"><h3>&#128203; Section 1 &#8212; Three-Way Item Matching</h3>'
     + matchingTable(data.matching_table || []) + "</div>"
