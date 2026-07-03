@@ -73,7 +73,7 @@ OPPORTUNITIES_NAME_FIELD   = "Deal_Name"   # fallback only, not used while id is
 GROSS_MARGIN_FIELD         = "GrossMarginCalc"    # field on Deals holding Gross Margin %
 
 VENDORS_MODULE       = "Vendors"        # custom module API name
-VENDORS_NAME_FIELD   = "Vendor"           # field used to search Vendors by name
+VENDORS_NAME_FIELD   = "Name"           # field used to search Vendors by name
 VENDOR_MARGIN_FIELD  = "Vendor_Margin"  # field on Vendors holding Vendor Margin %
 
 # ─────────────────────────────────────────────
@@ -770,6 +770,21 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
 
     fc_details = "".join([f"<li>{d}</li>" for d in (result.get("final_call_detail") or [])])
 
+    # ── Margin gate pass banner ──────────────────────────────
+    # Only shown when the gate actually ran and passed (result["margin_gate"]["checked"]
+    # is True). The on-hold/failed case never reaches PDF generation at all — that path
+    # short-circuits before any PDF work, per the margin gate design.
+    mg = result.get("margin_gate") or {}
+    margin_pass_block = ""
+    if mg.get("checked"):
+        gm = mg.get("gross_margin")
+        vm = mg.get("vendor_margin")
+        margin_pass_block = f"""<div class="margin-pass-banner">
+        <span class="mp-title">&#10003; Margin check passed</span>
+        <span class="mp-stat"><span class="mp-label">Gross Margin</span>{gm if gm is not None else '—'}%</span>
+        <span class="mp-stat"><span class="mp-label">Vendor Margin</span>{vm if vm is not None else '—'}%</span>
+      </div>"""
+
     # ── Currency overview block ──────────────────────────────
     currencies     = result.get("currencies_detected") or {}
     qc             = currencies.get("quote_currency") or "—"
@@ -916,6 +931,14 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
   .currency-tag-label {{ font-size: 7px; text-transform: uppercase; letter-spacing: 0.05em; color: #9ca3af; font-weight: 700; }}
   .currency-tag-value {{ font-size: 11px; font-weight: 700; color: #1a1a2e; font-family: monospace; }}
   .currency-notes {{ font-size: 9px; color: #374151; line-height: 1.5; border-top: 1px solid #f3f4f6; padding-top: 6px; margin-top: 4px; }}
+  .margin-pass-banner {{
+    background: #d1fae5; border: 1px solid #6ee7b7; border-radius: 6px;
+    padding: 7px 12px; margin-bottom: 12px; font-size: 9px; color: #065f46;
+    display: flex; align-items: center; gap: 16px;
+  }}
+  .margin-pass-banner .mp-title {{ font-weight: bold; }}
+  .margin-pass-banner .mp-stat {{ font-family: monospace; font-weight: 600; }}
+  .margin-pass-banner .mp-label {{ font-family: Arial, Helvetica, sans-serif; font-weight: normal; color: #047857; margin-right: 3px; }}
 </style>
 </head>
 <body>
@@ -923,6 +946,7 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
     <h1>Procurement Analysis Report</h1>
     <div class="subtitle">Quote: {quote_subject} &nbsp;|&nbsp; Generated: {generated_at}{by_line}</div>
   </div>
+  {margin_pass_block}
   {currency_block}
   {header_validation_block}
   <div class="banner">
