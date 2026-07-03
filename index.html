@@ -197,6 +197,31 @@
     margin-bottom: 16px; display: flex;
     align-items: center; gap: 8px;
   }
+
+  /* ── MARGIN GATE — HOLD (full short-circuit banner) ── */
+  .margin-hold { flex-direction: column; align-items: stretch; }
+  .margin-hold .fc-row { display: flex; align-items: flex-start; gap: 12px; }
+  .margin-stats { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 16px; }
+  .margin-stat {
+    background: rgba(255,255,255,0.6); border-radius: 8px; padding: 8px 14px;
+    display: flex; flex-direction: column; gap: 2px; min-width: 130px;
+  }
+  .margin-stat .m-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; font-weight: 700; }
+  .margin-stat .m-value { font-size: 16px; font-weight: 700; color: #1a1a2e; font-family: monospace; }
+  .margin-stat .m-value.bad  { color: #ef4444; }
+  .margin-stat .m-value.good { color: #065f46; }
+
+  /* ── MARGIN GATE — PASS (small confirmation banner, processing continues) ── */
+  .margin-pass-banner {
+    background: #d1fae5; border: 1px solid #6ee7b7;
+    border-radius: 8px; padding: 10px 16px;
+    font-size: 12px; color: #065f46;
+    margin-bottom: 16px; display: flex;
+    align-items: center; gap: 18px; flex-wrap: wrap;
+  }
+  .margin-pass-banner .mp-title { font-weight: 700; display: flex; align-items: center; gap: 6px; }
+  .margin-pass-banner .mp-stat { font-family: monospace; font-weight: 600; }
+  .margin-pass-banner .mp-stat .mp-label { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-weight: 400; color: #047857; margin-right: 4px; }
 </style>
 </head>
 <body>
@@ -228,6 +253,7 @@ var currentJobId = null;
 // Phase definitions — order determines progress list
 var PHASES = [
   "Fetching quote from Zoho...",
+  "Checking vendor & opportunity margins...",
   "Downloading PDF attachments...",
   "Extracting line items with Gemini AI...",
   "Comparing documents with Claude AI...",
@@ -244,14 +270,17 @@ function showLoading(phase) {
     _loadingStart = Date.now();
   }
 
-  // Build phase list
+  // Build phase list — match by index, not by "first non-match wins".
+  // If the current phase text isn't found in PHASES at all (e.g. list gets
+  // out of sync with the backend in future), nothing is falsely marked done.
+  var activeIndex = PHASES.indexOf(phase);
   var phaseHTML = '<ul class="phase-list">';
-  var activeFound = false;
   for (var i = 0; i < PHASES.length; i++) {
-    var isActive = (PHASES[i] === phase);
-    var isDone   = !activeFound && !isActive && phase !== null;
-    if (isActive) activeFound = true;
-    var cls = isActive ? "active" : (isDone ? "done" : "");
+    var cls = "";
+    if (activeIndex !== -1) {
+      if (i < activeIndex)      cls = "done";
+      else if (i === activeIndex) cls = "active";
+    }
     phaseHTML += '<li class="' + cls + '">' + PHASES[i] + '</li>';
   }
   phaseHTML += '</ul>';
@@ -627,16 +656,56 @@ function summarySection(data) {
     + '<p style="font-size:12px;color:#374151;line-height:1.6">' + (data.overall_summary || "") + "</p></div>";
 }
 
+function marginStat(label, value, tone) {
+  var cls = tone ? " " + tone : "";
+  return '<div class="margin-stat">'
+    + '<span class="m-label">' + label + '</span>'
+    + '<span class="m-value' + cls + '">' + (value === null || value === undefined || value === "" ? "&#8212;" : value) + '</span>'
+    + '</div>';
+}
+
+// Full short-circuit banner — shown INSTEAD OF the normal result when the
+// margin gate blocks the quote. No currency card, no header validation,
+// no matching table, no summary — just this.
+function marginHoldBanner(data) {
+  var detail = (data.final_call_detail && data.final_call_detail[0]) || "";
+  var gm = data.gross_margin;
+  var vm = data.vendor_margin;
+  return '<div class="final-call hold margin-hold">'
+    + '<div class="fc-row">'
+    + '<div class="fc-icon">&#128308;</div>'
+    + '<div class="fc-body">'
+    + '<div class="fc-title">' + (data.final_call || "ON HOLD &#8212; MARGIN CHECK FAILED") + '</div>'
+    + (detail ? '<p style="font-size:12px;color:#374151;line-height:1.6;margin-top:2px">' + detail + '</p>' : '')
+    + '</div></div>'
+    + '<div class="margin-stats">'
+    + marginStat("Opportunity", data.opportunity_name, null)
+    + marginStat("Vendor", data.vendor_name, null)
+    + marginStat("Gross Margin %", (gm !== null && gm !== undefined) ? gm + '%' : null, "bad")
+    + marginStat("Vendor Margin %", (vm !== null && vm !== undefined) ? vm + '%' : null, "good")
+    + '</div>'
+    + '<div class="btn-row" style="margin-top:18px">'
+    + '<button class="btn btn-secondary" onclick="showRunConfirmation(\'' + currentQuoteId + '\')">&#128260; Run Again</button>'
+    + '</div>'
+    + '</div>';
+}
+
+// Small confirmation banner — shown ABOVE the normal full result when the
+// margin gate ran and passed. Processing continues underneath as usual.
+function marginPassBanner(mg) {
+  var gm = mg.gross_margin;
+  var vm = mg.vendor_margin;
+  return '<div class="margin-pass-banner">'
+    + '<span class="mp-title">&#9989; Margin check passed</span>'
+    + '<span class="mp-stat"><span class="mp-label">Gross Margin</span>' + (gm !== null && gm !== undefined ? gm + '%' : '—') + '</span>'
+    + '<span class="mp-stat"><span class="mp-label">Vendor Margin</span>' + (vm !== null && vm !== undefined ? vm + '%' : '—') + '</span>'
+    + '</div>';
+}
+
 function render(data, generatedAt,quoteRef) {
   stopTimer();
-  var savedBanner = generatedAt
-    ? '<div class="saved-banner">Report saved as PDF attachment'
-      + (quoteRef ? ' &nbsp;|&nbsp; <strong>' + quoteRef + '</strong>' : '')
-      + ' &nbsp;(' + generatedAt + ')'
-      + ' &nbsp;<button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" '
-      + 'onclick="showRunConfirmation(\'' + currentQuoteId + '\')">&#128260; Run Fresh</button></div>'
-    : "";
-    // Quote reference header
+
+  // Quote reference header — always fine to show
   var quoteHeader = (quoteRef)
     ? '<div style="background:#fff;border-radius:8px;padding:10px 16px;'
       + 'margin-bottom:16px;border:1px solid #e5e7eb;font-size:12px;color:#374151">'
@@ -646,9 +715,29 @@ function render(data, generatedAt,quoteRef) {
       + '</div>'
     : "";
 
+  // ── MARGIN GATE HOLD — short-circuit, no document comparison was run.
+  //    Show ONLY the quote header + the margin-fail banner, nothing else.
+  if (data.margin_check_failed) {
+    document.getElementById("app").innerHTML = quoteHeader + marginHoldBanner(data);
+    return;
+  }
+
+  var savedBanner = generatedAt
+    ? '<div class="saved-banner">Report saved as PDF attachment'
+      + (quoteRef ? ' &nbsp;|&nbsp; <strong>' + quoteRef + '</strong>' : '')
+      + ' &nbsp;(' + generatedAt + ')'
+      + ' &nbsp;<button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" '
+      + 'onclick="showRunConfirmation(\'' + currentQuoteId + '\')">&#128260; Run Fresh</button></div>'
+    : "";
+
+  // Margin gate ran and passed — show a small confirmation, then continue
+  // with the full result exactly as before.
+  var marginPass = (data.margin_gate && data.margin_gate.checked) ? marginPassBanner(data.margin_gate) : "";
+
   document.getElementById("app").innerHTML =
     savedBanner
     + quoteHeader
+    + marginPass
     + currencyCard(data)
     + headerValidationCard(data)
     + finalCallBanner(data)

@@ -48,6 +48,35 @@ VQ_PDF_FIELD         = os.environ.get("VQ_PDF_FIELD", "VQ_PDF")
 ACCESS_TOKEN_URL     = os.environ.get("ACCESS_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
 
 # ─────────────────────────────────────────────
+# MARGIN GATE CONFIG — hardcoded, no env vars
+# Vendor name is already read directly off the Quote (quote.get("Vendor")).
+# Opportunity name is read the same way, off OPPORTUNITY_FIELD_ON_QUOTE below.
+# The Quote only stores descriptive *names* for both, not record ids, so the
+# gate resolves the real record by searching each related module by name.
+# VERIFY these against your org with GET /inspect-quote/{quote_id} and edit
+# these constants directly (no redeploy env-var juggling needed — just a
+# code change + redeploy).
+# ─────────────────────────────────────────────
+OPPORTUNITY_FIELD_ON_QUOTE = "Deal_Name"   # field on Quotes holding the Opportunity's lookup
+
+OPPORTUNITIES_MODULE       = "Deals"       # Zoho API module name — ALWAYS "Deals" even if
+                                            # the UI tab is relabeled "Opportunities" (tab
+                                            # renaming is display-only, doesn't change api_name)
+OPPORTUNITIES_NAME_FIELD   = "Deal_Name"   # fallback only, not used while id is present
+# NOTE: this org has FOUR different fields all labeled some variant of "Gross Margin"
+# on the Deals/Opportunities module (Gross_Margin, Gross_Deal_Margin, GrossMarginCalc,
+# Gross_Margin_USD) — confirmed via Setup > Developer Space > API Names. Only
+# GrossMarginCalc (a formula field, label "Gross Margin(%)" — no space before the
+# parenthesis) is actually populated on real records. Gross_Margin (decimal,
+# label "Gross Margin (%)" — WITH a space) looked identical in the UI but was
+# always null. Verify against a real record if this ever needs revisiting.
+GROSS_MARGIN_FIELD         = "GrossMarginCalc"    # field on Deals holding Gross Margin %
+
+VENDORS_MODULE       = "Vendors"        # custom module API name
+VENDORS_NAME_FIELD   = "Vendor"           # field used to search Vendors by name
+VENDOR_MARGIN_FIELD  = "Vendor_Margin"  # field on Vendors holding Vendor Margin %
+
+# ─────────────────────────────────────────────
 # IN-MEMORY STORES
 # ─────────────────────────────────────────────
 jobs      = {}
@@ -235,6 +264,159 @@ def download_zoho_file(file_id, token):
     r.raise_for_status()
     print(f"✅ Downloaded file {file_id} ({len(r.content)} bytes)")
     return r.content
+
+
+# ─────────────────────────────────────────────
+# 3b. MARGIN GATE — resolve Vendor / Opportunity records by name
+#     and compare Gross Margin % vs Vendor Margin %
+# ─────────────────────────────────────────────
+def search_zoho_record_by_name(module: str, name: str, name_field: str, token: str) -> dict:
+    """The Quote only stores descriptive names (e.g. quote['Vendor'] = 'Acme Corp'),
+    not record ids, so we search the related module for a matching name.
+    Requires `name_field` to be marked searchable in Zoho module setup."""
+    if not name:
+        return None
+    url     = f"{ZOHO_BASE_URL}/crm/v3/{module}/search"
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    params  = {"criteria": f"({name_field}:equals:{name})"}
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    if r.status_code == 204:
+        return None
+    if not r.ok:
+        raise Exception(
+            f"Zoho API error searching {module} for {name_field}='{name}': "
+            f"{r.status_code} {r.text[:500]}"
+        )
+    data = r.json().get("data", [])
+    return data[0] if data else None
+
+
+def fetch_zoho_record(module: str, record_id: str, token: str, fields: str = None) -> dict:
+    """Fetch a single record by id from any Zoho CRM module."""
+    url     = f"{ZOHO_BASE_URL}/crm/v3/{module}/{record_id}"
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    params  = {"fields": fields} if fields else {}
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    if not r.ok:
+        raise Exception(
+            f"Zoho API error fetching {module}/{record_id} (fields={fields}): "
+            f"{r.status_code} {r.text[:500]}"
+        )
+    data = r.json().get("data", [])
+    if not data:
+        raise Exception(f"No record found in {module} with id {record_id}")
+    return data[0]
+
+
+def parse_percentage(value):
+    """Coerce a margin value (number, '15', '15%', etc.) to a float, or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace("%", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def resolve_margin_by_name(raw_value, module: str, name_field: str,
+                            margin_field: str, token: str):
+    """
+    raw_value is whatever came straight off the Quote for Vendor / Opportunity —
+    it can be:
+      - a Zoho lookup dict {"id": "...", "name": "..."} → fetch directly by id.
+        This is the expected path for both Vendor and Opportunity on this org's
+        Quotes module. If this fetch fails, the error is NOT swallowed/retried
+        via search — it propagates up so the real cause (wrong module name,
+        wrong field name, etc.) is visible instead of being masked.
+      - a plain string (display name only, no id — not currently expected for
+        Vendor/Opportunity on this org, kept as a safety net for other future
+        uses of this function) → search-by-name
+      - None / "N/A" / "" → nothing to resolve
+    Returns (matched_display_name, margin_value_or_None).
+    """
+    if not raw_value or raw_value == "N/A":
+        return None, None
+
+    if isinstance(raw_value, dict):
+        record_id    = raw_value.get("id")
+        display_name = raw_value.get("name")
+        if record_id:
+            # Direct id fetch only — no fallback to search. We already have the
+            # display name from this lookup dict, so we only need to request the
+            # margin field (avoids depending on name_field being a valid/requestable
+            # field on this module, which it may not be after a module rename).
+            record = fetch_zoho_record(module, record_id, token, fields=margin_field)
+            return display_name, parse_percentage(record.get(margin_field))
+        raw_value = display_name  # dict with no id at all — only then try name search
+
+    if not raw_value:
+        return None, None
+
+    found = search_zoho_record_by_name(module, raw_value, name_field, token)
+    if not found:
+        print(f"⚠️  No {module} record found matching name '{raw_value}' (searched field '{name_field}')")
+        return raw_value, None
+
+    record = fetch_zoho_record(module, found["id"], token, fields=f"{margin_field},{name_field}")
+    return record.get(name_field) or raw_value, parse_percentage(record.get(margin_field))
+
+
+def check_margin_gate(quote: dict, token: str) -> dict:
+    """
+    Opportunity Gross Margin % vs Vendor Margin % check — runs first, before
+    any PDF work. 'blocked' is True only when BOTH margins resolve and
+    gross_margin < vendor_margin. Any failure — missing data, unresolvable
+    name, unexpected API error — results in the gate being SKIPPED, never
+    blocked, and is logged clearly. A margin-gate config issue must never
+    silently stall a legitimate comparison run.
+    """
+    outcome = {
+        "blocked":          False,
+        "opportunity_name": None,
+        "vendor_name":      None,
+        "gross_margin":     None,
+        "vendor_margin":    None,
+        "skipped_reason":   None,
+    }
+
+    try:
+        vendor_raw      = quote.get("Vendor")
+        opportunity_raw = quote.get(OPPORTUNITY_FIELD_ON_QUOTE)
+
+        vendor_display, vendor_margin = resolve_margin_by_name(
+            vendor_raw, VENDORS_MODULE, VENDORS_NAME_FIELD, VENDOR_MARGIN_FIELD, token
+        )
+        opp_display, gross_margin = resolve_margin_by_name(
+            opportunity_raw, OPPORTUNITIES_MODULE, OPPORTUNITIES_NAME_FIELD, GROSS_MARGIN_FIELD, token
+        )
+    except Exception as e:
+        print(f"⚠️  Margin gate failed unexpectedly — skipping gate, proceeding to comparison. Reason: {e}")
+        outcome["skipped_reason"] = f"Margin gate error: {e}"
+        return outcome
+
+    outcome["opportunity_name"] = opp_display
+    outcome["vendor_name"]      = vendor_display
+    outcome["gross_margin"]     = gross_margin
+    outcome["vendor_margin"]    = vendor_margin
+
+    if gross_margin is None or vendor_margin is None:
+        missing = []
+        if gross_margin  is None: missing.append(f"Gross Margin (Opportunity: {opp_display or 'not set on quote'})")
+        if vendor_margin is None: missing.append(f"Vendor Margin (Vendor: {vendor_display or 'not set on quote'})")
+        outcome["skipped_reason"] = "Missing: " + ", ".join(missing)
+        print(f"⚠️  Margin gate skipped — {outcome['skipped_reason']}")
+        return outcome
+
+    print(f"📊 Margin gate — Gross Margin: {gross_margin}% | Vendor Margin: {vendor_margin}%")
+    if gross_margin < vendor_margin:
+        outcome["blocked"] = True
+
+    return outcome
 
 
 # ─────────────────────────────────────────────
@@ -832,6 +1014,42 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
         print(f"[{job_id}] ⏱ Fetch quote: {time.time()-t0:.1f}s")
         print(f"Quote fields: {list(quote.keys())}")
 
+        quote_ref_early = quote.get("Quotation_Reference", "")
+
+        # ── MARGIN GATE — first check after reading the quote, before any
+        #    PDF download/extraction/comparison. If Gross Margin % (from the
+        #    Opportunity) is less than Vendor Margin % (from the Vendor),
+        #    the quote goes straight to ON HOLD and document comparison is skipped.
+        if is_cancelled(job_id): return
+        jobs[job_id]["phase"] = "Checking vendor & opportunity margins..."
+        margin = check_margin_gate(quote, token)
+
+        if margin["blocked"]:
+            print(f"[{job_id}] 🚫 Margin gate BLOCKED — Gross {margin['gross_margin']}% < Vendor {margin['vendor_margin']}%")
+            jobs[job_id] = {
+                "status": "done",
+                "result": {
+                    "margin_check_failed": True,
+                    "final_call": "ON HOLD — MARGIN CHECK FAILED",
+                    "final_call_detail": [
+                        f"Gross Margin ({margin['gross_margin']}%) is less than Vendor Margin "
+                        f"({margin['vendor_margin']}%) — quote is on hold pending review. "
+                        "Document comparison was not run."
+                    ],
+                    "opportunity_name": margin["opportunity_name"],
+                    "vendor_name":      margin["vendor_name"],
+                    "gross_margin":     margin["gross_margin"],
+                    "vendor_margin":    margin["vendor_margin"],
+                },
+                "generated_at": datetime.now().isoformat(),
+                "quote_ref":    quote_ref_early,
+            }
+            return
+        elif margin["skipped_reason"]:
+            print(f"[{job_id}] ℹ️  Margin gate skipped ({margin['skipped_reason']}) — continuing to document comparison")
+        else:
+            print(f"[{job_id}] ✅ Margin gate passed — Gross {margin['gross_margin']}% >= Vendor {margin['vendor_margin']}%")
+
         if is_cancelled(job_id): return
         zoho_text = format_zoho_quote(quote)
         print(f"Quote items to be sent to Gemini: {zoho_text}")
@@ -941,6 +1159,18 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
         result = run_comparison(zoho_text, ppo_text, vq_text, job_id)
         print(f"The final result from claude is : {result}")
 
+        # Surface the margin gate outcome to the widget too, even on the pass
+        # path — lets the frontend show a small "margin check passed" banner
+        # before the normal comparison result. "checked" is False if the gate
+        # was skipped (missing data / config issue) so the widget shows nothing.
+        result["margin_gate"] = {
+            "checked":          margin["skipped_reason"] is None,
+            "opportunity_name": margin["opportunity_name"],
+            "vendor_name":      margin["vendor_name"],
+            "gross_margin":     margin["gross_margin"],
+            "vendor_margin":    margin["vendor_margin"],
+        }
+
         print(f"[{job_id}] ⏱ Claude done: {time.time()-t0:.1f}s")
         jobs[job_id]["phase"] = "Generating PDF report..."
 
@@ -1024,6 +1254,45 @@ def check_report(quote_id: str):
         return {"exists": False}
     except Exception as e:
         return {"exists": False, "error": str(e)}
+
+
+@app.get("/inspect-quote/{quote_id}")
+def inspect_quote(quote_id: str):
+    """
+    DEBUG — hit this once with a real quote_id to confirm the margin-gate
+    config constants (top of file) match your org before trusting the gate
+    in production. Shows the raw Vendor / Opportunity field values on the
+    quote, the full margin-gate resolution, and every field name on the quote
+    so you can spot the correct Opportunity field if OPPORTUNITY_FIELD_ON_QUOTE
+    is wrong. Remove or protect this endpoint once confirmed.
+    """
+    try:
+        token = get_access_token()
+        quote = fetch_zoho_quote(quote_id, token)
+
+        result = {
+            "config": {
+                "OPPORTUNITY_FIELD_ON_QUOTE": OPPORTUNITY_FIELD_ON_QUOTE,
+                "OPPORTUNITIES_MODULE":       OPPORTUNITIES_MODULE,
+                "OPPORTUNITIES_NAME_FIELD":   OPPORTUNITIES_NAME_FIELD,
+                "GROSS_MARGIN_FIELD":         GROSS_MARGIN_FIELD,
+                "VENDORS_MODULE":             VENDORS_MODULE,
+                "VENDORS_NAME_FIELD":         VENDORS_NAME_FIELD,
+                "VENDOR_MARGIN_FIELD":        VENDOR_MARGIN_FIELD,
+            },
+            "raw_vendor_value":       quote.get("Vendor"),
+            "raw_opportunity_value":  quote.get(OPPORTUNITY_FIELD_ON_QUOTE),
+            "all_quote_field_names":  sorted(quote.keys()),
+        }
+
+        try:
+            result["margin_gate_result"] = check_margin_gate(quote, token)
+        except Exception as e:
+            result["margin_gate_error"] = str(e)
+
+        return result
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.post("/cancel-job/{job_id}")
