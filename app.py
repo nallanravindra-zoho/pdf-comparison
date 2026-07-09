@@ -77,6 +77,21 @@ VENDORS_NAME_FIELD   = "Name"           # field used to search Vendors by name
 VENDOR_MARGIN_FIELD  = "Vendor_Margin"  # field on Vendors holding Vendor Margin %
 
 # ─────────────────────────────────────────────
+# SUBTOTAL VALIDATION CONFIG — hardcoded, no env vars
+# Compares PDF-extracted subtotals (converted to USD) against two Opportunity
+# fields. Fetched in the SAME Opportunity API call the Margin Gate already
+# makes (see resolve_margin_by_name's extra_fields param) — no extra round trip.
+# VERIFY these field names against your org with GET /inspect-quote/{quote_id}.
+# ─────────────────────────────────────────────
+AMOUNT_IN_USD_FIELD = "Amount_in_USD"   # field on Deals — compared against Partner PO Subtotal (converted to USD)
+NET_TO_VENDOR_FIELD = "Net_to_Vendor"   # field on Deals — compared against Vendor Quote Subtotal (converted to USD)
+                                         # ASSUMPTION: Net_to_Vendor is itself stored in USD already
+                                         # (matching the Amount_in_USD naming convention on this Opportunity
+                                         # module). If that's wrong, tell me and this needs a currency field too.
+SUBTOTAL_TOLERANCE_USD = 1.00           # looser than the ±0.50 line-item tolerance — subtotals sum many
+                                         # lines, so small per-line rounding differences compound
+
+# ─────────────────────────────────────────────
 # IN-MEMORY STORES
 # ─────────────────────────────────────────────
 jobs      = {}
@@ -323,8 +338,43 @@ def parse_percentage(value):
         return None
 
 
+def parse_amount(value):
+    """Coerce a money value (number, '1,234.50', '$1234.50', 'USD 1234.50', etc.)
+    to a float, or None. Strips thousands separators and common currency symbols/codes."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    s = re.sub(r"[,$€£]", "", s)
+    s = re.sub(r"\b(USD|AED|SAR|QAR)\b", "", s, flags=re.IGNORECASE).strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+# Fixed exchange rates to USD — same anchor rates used in the Claude matching
+# prompt's Step 3c, kept in sync manually since Claude's copy lives in Zoho CRM.
+_USD_RATES = {"USD": 1.0, "AED": 1 / 3.6725, "SAR": 1 / 3.7500, "QAR": 1 / 3.6500}
+
+
+def convert_to_usd(amount, currency):
+    """Convert amount (in `currency`) to USD using the fixed rate table.
+    Returns None if amount is missing or currency is unsupported/blank —
+    never guesses a rate for an unrecognised currency code."""
+    if amount is None or not currency:
+        return None
+    rate = _USD_RATES.get(str(currency).strip().upper())
+    if rate is None:
+        return None
+    return round(amount * rate, 2)
+
+
 def resolve_margin_by_name(raw_value, module: str, name_field: str,
-                            margin_field: str, token: str):
+                            margin_field: str, token: str, extra_fields: str = None):
     """
     raw_value is whatever came straight off the Quote for Vendor / Opportunity —
     it can be:
@@ -337,10 +387,18 @@ def resolve_margin_by_name(raw_value, module: str, name_field: str,
         Vendor/Opportunity on this org, kept as a safety net for other future
         uses of this function) → search-by-name
       - None / "N/A" / "" → nothing to resolve
-    Returns (matched_display_name, margin_value_or_None).
+
+    extra_fields: optional comma-separated list of additional field API names to
+    fetch on the SAME record (avoids a second round trip for callers that need
+    more than just the margin field — e.g. the Opportunity record is also used
+    for Subtotal Validation). Returns (matched_display_name, margin_value_or_None,
+    full_record_dict_or_None) — the record dict contains margin_field plus any
+    extra_fields requested, so callers can pull additional values off it directly.
     """
     if not raw_value or raw_value == "N/A":
-        return None, None
+        return None, None, None
+
+    fields_to_request = margin_field if not extra_fields else f"{margin_field},{extra_fields}"
 
     if isinstance(raw_value, dict):
         record_id    = raw_value.get("id")
@@ -350,20 +408,20 @@ def resolve_margin_by_name(raw_value, module: str, name_field: str,
             # display name from this lookup dict, so we only need to request the
             # margin field (avoids depending on name_field being a valid/requestable
             # field on this module, which it may not be after a module rename).
-            record = fetch_zoho_record(module, record_id, token, fields=margin_field)
-            return display_name, parse_percentage(record.get(margin_field))
+            record = fetch_zoho_record(module, record_id, token, fields=fields_to_request)
+            return display_name, parse_percentage(record.get(margin_field)), record
         raw_value = display_name  # dict with no id at all — only then try name search
 
     if not raw_value:
-        return None, None
+        return None, None, None
 
     found = search_zoho_record_by_name(module, raw_value, name_field, token)
     if not found:
         print(f"⚠️  No {module} record found matching name '{raw_value}' (searched field '{name_field}')")
-        return raw_value, None
+        return raw_value, None, None
 
-    record = fetch_zoho_record(module, found["id"], token, fields=f"{margin_field},{name_field}")
-    return record.get(name_field) or raw_value, parse_percentage(record.get(margin_field))
+    record = fetch_zoho_record(module, found["id"], token, fields=f"{fields_to_request},{name_field}")
+    return record.get(name_field) or raw_value, parse_percentage(record.get(margin_field)), record
 
 
 def check_margin_gate(quote: dict, token: str) -> dict:
@@ -374,6 +432,11 @@ def check_margin_gate(quote: dict, token: str) -> dict:
     name, unexpected API error — results in the gate being SKIPPED, never
     blocked, and is logged clearly. A margin-gate config issue must never
     silently stall a legitimate comparison run.
+
+    Also resolves amount_in_usd / net_to_vendor off the SAME Opportunity record
+    fetch (see AMOUNT_IN_USD_FIELD / NET_TO_VENDOR_FIELD) — these aren't used by
+    the gate itself, they're carried in the outcome for the later Subtotal
+    Validation check so that check doesn't need its own Opportunity API call.
     """
     outcome = {
         "blocked":          False,
@@ -382,17 +445,20 @@ def check_margin_gate(quote: dict, token: str) -> dict:
         "gross_margin":     None,
         "vendor_margin":    None,
         "skipped_reason":   None,
+        "amount_in_usd":    None,
+        "net_to_vendor":    None,
     }
 
     try:
         vendor_raw      = quote.get("Vendor")
         opportunity_raw = quote.get(OPPORTUNITY_FIELD_ON_QUOTE)
 
-        vendor_display, vendor_margin = resolve_margin_by_name(
+        vendor_display, vendor_margin, _ = resolve_margin_by_name(
             vendor_raw, VENDORS_MODULE, VENDORS_NAME_FIELD, VENDOR_MARGIN_FIELD, token
         )
-        opp_display, gross_margin = resolve_margin_by_name(
-            opportunity_raw, OPPORTUNITIES_MODULE, OPPORTUNITIES_NAME_FIELD, GROSS_MARGIN_FIELD, token
+        opp_display, gross_margin, opp_record = resolve_margin_by_name(
+            opportunity_raw, OPPORTUNITIES_MODULE, OPPORTUNITIES_NAME_FIELD, GROSS_MARGIN_FIELD, token,
+            extra_fields=f"{AMOUNT_IN_USD_FIELD},{NET_TO_VENDOR_FIELD}"
         )
     except Exception as e:
         print(f"⚠️  Margin gate failed unexpectedly — skipping gate, proceeding to comparison. Reason: {e}")
@@ -403,6 +469,9 @@ def check_margin_gate(quote: dict, token: str) -> dict:
     outcome["vendor_name"]      = vendor_display
     outcome["gross_margin"]     = gross_margin
     outcome["vendor_margin"]    = vendor_margin
+    if opp_record:
+        outcome["amount_in_usd"] = parse_amount(opp_record.get(AMOUNT_IN_USD_FIELD))
+        outcome["net_to_vendor"] = parse_amount(opp_record.get(NET_TO_VENDOR_FIELD))
 
     if gross_margin is None or vendor_margin is None:
         missing = []
@@ -417,6 +486,74 @@ def check_margin_gate(quote: dict, token: str) -> dict:
         outcome["blocked"] = True
 
     return outcome
+
+
+def check_subtotal_validation(quote: dict, margin: dict, ppo_header: dict, vq_header: dict) -> dict:
+    """
+    Subtotal Validation — a reporting-only card, never blocks the pipeline and
+    never affects final_call. Computed deterministically in Python (same
+    reasoning as the Margin Gate: this is arithmetic + a fixed exchange rate
+    table, not a judgement call, so it shouldn't be delegated to Claude).
+
+    Two independent checks:
+      A. Partner PO Subtotal (converted to USD) vs Opportunity's Amount_in_USD
+      B. Vendor Quote Subtotal (converted to USD) vs Opportunity's Net_to_Vendor
+         (ASSUMES Net_to_Vendor is already stored in USD — see config note)
+
+    Each check is "Match" | "Mismatch" | "Needs Review" (Needs Review when
+    either side is missing/unresolvable — deliberately not forced into a binary
+    match/mismatch when the data to make that call isn't actually available).
+    overall_status is "Match" only if both checks are "Match".
+    """
+    partner_po_currency   = quote.get("Partner_PO_Currency") or ""
+    vendor_quote_currency = quote.get("Vendor_Quote_Currency") or ""
+
+    ppo_subtotal_raw = parse_amount((ppo_header or {}).get("partner_po_subtotal"))
+    vq_subtotal_raw  = parse_amount((vq_header or {}).get("vendor_quote_subtotal"))
+
+    ppo_subtotal_usd = convert_to_usd(ppo_subtotal_raw, partner_po_currency)
+    vq_subtotal_usd  = convert_to_usd(vq_subtotal_raw, vendor_quote_currency)
+
+    amount_in_usd = margin.get("amount_in_usd")
+    net_to_vendor = margin.get("net_to_vendor")
+
+    def _compare(pdf_val_usd, opp_val):
+        if pdf_val_usd is None or opp_val is None:
+            return "Needs Review"
+        return "Match" if abs(pdf_val_usd - opp_val) <= SUBTOTAL_TOLERANCE_USD else "Mismatch"
+
+    ppo_status = _compare(ppo_subtotal_usd, amount_in_usd)
+    vq_status  = _compare(vq_subtotal_usd, net_to_vendor)
+
+    if ppo_status == "Mismatch" or vq_status == "Mismatch":
+        overall = "Mismatch"
+    elif ppo_status == "Needs Review" or vq_status == "Needs Review":
+        overall = "Needs Review"
+    else:
+        overall = "Match"
+
+    print(f"💰 Subtotal validation — PPO: {ppo_subtotal_usd} USD vs Amount_in_USD {amount_in_usd} → {ppo_status} | "
+          f"VQ: {vq_subtotal_usd} USD vs Net_to_Vendor {net_to_vendor} → {vq_status}")
+
+    return {
+        "overall_status": overall,
+        "partner_po": {
+            "label":             "Partner PO Subtotal vs Amount (USD)",
+            "pdf_subtotal":      ppo_subtotal_raw,
+            "pdf_currency":      partner_po_currency or None,
+            "pdf_subtotal_usd":  ppo_subtotal_usd,
+            "opportunity_value": amount_in_usd,
+            "status":            ppo_status,
+        },
+        "vendor_quote": {
+            "label":             "Vendor Quote Subtotal vs Net to Vendor (USD)",
+            "pdf_subtotal":      vq_subtotal_raw,
+            "pdf_currency":      vendor_quote_currency or None,
+            "pdf_subtotal_usd":  vq_subtotal_usd,
+            "opportunity_value": net_to_vendor,
+            "status":            vq_status,
+        },
+    }
 
 
 # ─────────────────────────────────────────────
@@ -591,16 +728,20 @@ def get_gemini_model() -> str:
 #    OPT 1: Returns compact JSON string
 #    (fewer tokens to Claude vs verbose text)
 # ─────────────────────────────────────────────
-def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None, prompt: str = "") -> str:
+def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: str = None, prompt: str = ""):
     """Extract header fields AND line items from a PDF using Gemini.
 
     The updated Gemini prompt returns:
-      { "header": { reseller_name, partner_po_ref, vendor_name, vendor_quote_ref },
+      { "header": { reseller_name, partner_po_ref, vendor_name, vendor_quote_ref,
+                     partner_po_subtotal, vendor_quote_subtotal },
         "line_items": [ { line_num, sku, description, quantity, list_unit_price }, ... ] }
 
     Legacy flat-array responses are still handled gracefully.
-    Returns a formatted text block with HEADER FIELDS and LINE ITEMS sections
-    for Claude to consume.
+    Returns a TUPLE: (formatted_text_block, header_dict).
+      - formatted_text_block: for Claude to consume (HEADER FIELDS + LINE ITEMS sections)
+      - header_dict: the raw parsed header dict, used directly in Python for Subtotal
+        Validation (check_subtotal_validation) without re-parsing Claude's prose. Empty
+        dict {} if parsing failed — callers must handle a header dict with no keys.
     """
     if job_id and is_cancelled(job_id):
         print(f"🔍 Cancelled before {label} extraction")
@@ -641,12 +782,14 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: st
 
         lines = [f"## {label}"]
 
-        # Header section — always emit all four keys so Claude has them
+        # Header section — always emit all six keys so Claude has them
         lines.append("### HEADER FIELDS")
-        lines.append(f"  reseller_name    : {header.get('reseller_name') or 'null'}")
-        lines.append(f"  partner_po_ref   : {header.get('partner_po_ref') or 'null'}")
-        lines.append(f"  vendor_name      : {header.get('vendor_name') or 'null'}")
-        lines.append(f"  vendor_quote_ref : {header.get('vendor_quote_ref') or 'null'}")
+        lines.append(f"  reseller_name         : {header.get('reseller_name') or 'null'}")
+        lines.append(f"  partner_po_ref        : {header.get('partner_po_ref') or 'null'}")
+        lines.append(f"  vendor_name           : {header.get('vendor_name') or 'null'}")
+        lines.append(f"  vendor_quote_ref      : {header.get('vendor_quote_ref') or 'null'}")
+        lines.append(f"  partner_po_subtotal   : {header.get('partner_po_subtotal') if header.get('partner_po_subtotal') is not None else 'null'}")
+        lines.append(f"  vendor_quote_subtotal : {header.get('vendor_quote_subtotal') if header.get('vendor_quote_subtotal') is not None else 'null'}")
         lines.append("")
 
         # Line items section
@@ -659,11 +802,11 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, job_id: st
                 f"list_unit_price: {item.get('list_unit_price','N/A')}"
             )
 
-        return "\n".join(lines)
+        return "\n".join(lines), header
 
     except (json.JSONDecodeError, ValueError) as e:
         print(f"⚠️  Gemini JSON parse error for {label}: {e}")
-        return raw
+        return raw, {}
 
 
 # ─────────────────────────────────────────────
@@ -870,6 +1013,46 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
+    # ── Subtotal validation block (vs Opportunity Amount_in_USD / Net_to_Vendor) ──
+    sv = result.get("subtotal_validation") or {}
+    subtotal_validation_block = ""
+    if sv:
+        def _sv_row(d):
+            if not d:
+                return ""
+            pdf_usd = d.get("pdf_subtotal_usd")
+            opp_val = d.get("opportunity_value")
+            pdf_raw = d.get("pdf_subtotal")
+            pdf_usd_str = f"${pdf_usd:,.2f}" if pdf_usd is not None else "—"
+            opp_val_str = f"${opp_val:,.2f}" if opp_val is not None else "—"
+            pdf_raw_str = f"{pdf_raw:,.2f} {d.get('pdf_currency') or ''}".strip() if pdf_raw is not None else "—"
+            return (
+                f"<tr>"
+                f"<td style='font-weight:600;font-size:9px'>{d.get('label','')}</td>"
+                f"<td style='font-size:9px;font-family:monospace'>{pdf_raw_str}</td>"
+                f"<td style='font-size:9px;font-family:monospace'>{pdf_usd_str}</td>"
+                f"<td style='font-size:9px;font-family:monospace'>{opp_val_str}</td>"
+                f"<td style='text-align:center'>{status_badge(d.get('status'))}</td>"
+                f"</tr>"
+            )
+        sv_rows = _sv_row(sv.get("partner_po")) + _sv_row(sv.get("vendor_quote"))
+        subtotal_validation_block = f"""<div class="card">
+        <div class="card-title">Subtotal Validation (vs Opportunity)</div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:220px">Check</th>
+              <th style="width:140px">PDF Subtotal</th>
+              <th style="width:100px">Converted (USD)</th>
+              <th style="width:120px">Opportunity Value</th>
+              <th style="width:82px;text-align:center">Status</th>
+            </tr>
+          </thead>
+          <tbody>{sv_rows}</tbody>
+        </table>
+        <p style="font-size:9px;color:#374151;margin-top:6px">Overall: {status_badge(sv.get('overall_status'))}</p>
+      </div>"""
+
     must_resolve = "".join([f'<li class="item-red">{i}</li>'   for i in (result.get("must_resolve") or [])]) \
                    or '<li style="color:#6b7280;font-style:italic">None — all items cleared</li>'
     needs_review = "".join([f'<li class="item-amber">{i}</li>' for i in (result.get("needs_review") or [])]) \
@@ -972,6 +1155,7 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
       <tbody>{table_rows}</tbody>
     </table>
   </div>
+  {subtotal_validation_block}
   <div class="card">
     <div class="card-title">Section 2 - Summary</div>
     <div class="summary-label label-red">Must Resolve Before Processing</div>
@@ -1171,8 +1355,8 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
                     future_vq.cancel()
                     return
 
-            ppo_text = future_ppo.result()
-            vq_text = future_vq.result()
+            ppo_text, ppo_header = future_ppo.result()
+            vq_text, vq_header   = future_vq.result()
 
         print("VQ TEXT from Gemini:"+vq_text)
         print("Partner PO TEXT from Gemini:"+ppo_text)
@@ -1194,6 +1378,12 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
             "gross_margin":     margin["gross_margin"],
             "vendor_margin":    margin["vendor_margin"],
         }
+
+        # Subtotal Validation — Partner PO / Vendor Quote subtotals (converted to
+        # USD) vs the Opportunity's Amount_in_USD / Net_to_Vendor. Deterministic,
+        # computed here in Python, not by Claude. Reporting-only — never blocks
+        # the pipeline and doesn't factor into final_call.
+        result["subtotal_validation"] = check_subtotal_validation(quote, margin, ppo_header, vq_header)
 
         print(f"[{job_id}] ⏱ Claude done: {time.time()-t0:.1f}s")
         jobs[job_id]["phase"] = "Generating PDF report..."
