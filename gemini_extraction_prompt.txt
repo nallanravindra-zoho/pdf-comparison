@@ -18,6 +18,43 @@ For a PARTNER PO document (purchase order from a partner/reseller to Cyberknight
                         Look for headers like "Purchase Order", "PO Number", "PO #", "Order Number",
                         "Order Ref", "Reference". Return the value exactly as printed (e.g. "PO-2024-00123").
                         Return null if not found.
+  - partner_po_subtotal : The document's Subtotal — the sum of all line items BEFORE tax, VAT,
+                        shipping, freight, or any other charges are added. Determine this value
+                        in the following order:
+                          1. If a row explicitly labeled "Subtotal", "Sub Total", "Sub-total",
+                             "Net Total", "Total (excl. tax)", or similar is present — usually near
+                             the bottom of the document, above the tax/VAT line and the grand/final
+                             total — use that value directly.
+                          2. If no such row exists, but the document shows a Grand/Final Total AND a
+                             separate Tax/VAT amount (e.g. "VAT 5%: 1,350.00", "Tax: 200.00"), then
+                             CALCULATE: partner_po_subtotal = Grand/Final Total − Tax/VAT amount.
+                             This is the expected case for many documents that only show a
+                             tax-inclusive total with a VAT breakdown line, not an explicit
+                             "Subtotal" label.
+                          3. If there is only a single Total (no separate "Subtotal" row) AND no
+                             tax/VAT line or tax amount appears anywhere in the document at all —
+                             i.e. there is genuinely no tax being applied — then that single Total
+                             IS the subtotal (with zero tax, Subtotal = Total by definition). Use
+                             that value directly. Do not return null just because the word
+                             "Subtotal" itself doesn't appear — confirm first whether any tax/VAT
+                             is present anywhere in the document before deciding there's nothing to
+                             subtract.
+                          4. If it is genuinely unclear whether the single total shown includes tax
+                             or not (e.g. tax is mentioned but no amount is given, or the document
+                             is unreadable in that area), return null rather than guessing.
+                        Under NO circumstance return a tax-inclusive total as the subtotal — a value
+                        that still contains VAT/tax is not a valid subtotal, regardless of which rule
+                        above produced it. Return a numeric value only — no currency symbol, no
+                        thousands separators.
+                        Example (rule 1 applies — explicit Subtotal row present):
+                          "Sub Total   167,402.17"
+                          "VAT (5%)    8,370.11"
+                          "Total       AED175,772.28"
+                          → partner_po_subtotal = 167402.17 (read directly from the "Sub Total" row).
+                          Do NOT calculate 175772.28 − 8370.11 here even though it produces the same
+                          number in this example — rule 1 (explicit label) always takes priority over
+                          rule 2 (calculation) whenever an explicit Subtotal/Sub Total row is present.
+                          Only calculate Total − Tax when NO such explicit row exists at all.
 
 For a VENDOR QUOTE document (quote from a vendor to Cyberknight):
   - vendor_name       : The name of the vendor/supplier company that issued this quote.
@@ -30,6 +67,66 @@ For a VENDOR QUOTE document (quote from a vendor to Cyberknight):
                         "Quotation Number", "Quotation Ref", "Ref No", "Reference Number".
                         Return the value exactly as printed (e.g. "QT-2024-98765").
                         Return null if not found.
+  - vendor_quote_subtotal : The document's Subtotal — the sum of all line items BEFORE tax, VAT,
+                        shipping, freight, or any other charges are added. Determine this value
+                        in the following order:
+                          1. If a row explicitly labeled "Subtotal", "Sub Total", "Sub-total",
+                             "Net Total", "Total (excl. tax)", or similar is present — usually near
+                             the bottom of the document, above the tax/VAT line and the grand/final
+                             total — use that value directly.
+                          2. If no such row exists, but the document shows a Grand/Final Total AND a
+                             separate Tax/VAT amount (e.g. "VAT 5%: 1,350.00", "Tax: 200.00"), then
+                             CALCULATE: vendor_quote_subtotal = Grand/Final Total − Tax/VAT amount.
+                             This is the expected case for many documents that only show a
+                             tax-inclusive total with a VAT breakdown line, not an explicit
+                             "Subtotal" label.
+                          3. If there is only a single Total (no separate "Subtotal" row) AND no
+                             tax/VAT line or tax amount appears anywhere in the document at all —
+                             i.e. there is genuinely no tax being applied — then that single Total
+                             IS the subtotal (with zero tax, Subtotal = Total by definition). Use
+                             that value directly. Do not return null just because the word
+                             "Subtotal" itself doesn't appear — confirm first whether any tax/VAT
+                             is present anywhere in the document before deciding there's nothing to
+                             subtract. THIS IS THE COMMON CASE for vendor quotes — most vendor
+                             quotes carry no tax/VAT at all, so their single Total figure is
+                             normally the correct value to use here.
+                          4. If it is genuinely unclear whether the single total shown includes tax
+                             or not (e.g. tax is mentioned but no amount is given, or the document
+                             is unreadable in that area), return null rather than guessing.
+                        Under NO circumstance return a tax-inclusive total as the subtotal — a value
+                        that still contains VAT/tax is not a valid subtotal, regardless of which rule
+                        above produced it. Return a numeric value only — no currency symbol, no
+                        thousands separators.
+                        Example (rule 1 applies — explicit Subtotal row present):
+                          "Sub Total   167,402.17"
+                          "VAT (5%)    8,370.11"
+                          "Total       AED175,772.28"
+                          → vendor_quote_subtotal = 167402.17 (read directly from the "Sub Total" row).
+                          Do NOT calculate 175772.28 − 8370.11 here even though it produces the same
+                          number in this example — rule 1 (explicit label) always takes priority over
+                          rule 2 (calculation) whenever an explicit Subtotal/Sub Total row is present.
+                          Only calculate Total − Tax when NO such explicit row exists at all, and only
+                          use the single Total directly (rule 3) when there is no tax anywhere at all.
+
+
+IMPORTANT — reading reference numbers precisely (partner_po_ref, vendor_quote_ref):
+  - These are exact identifiers, not descriptive text — a single wrong digit makes the
+    value a different reference number entirely, so treat them with more care than
+    ordinary prose.
+  - Read the value character-by-character rather than recognizing it as a whole shape
+    at a glance. Count each digit individually before returning it.
+  - Pay particular attention to runs of repeated or similar-looking digits (e.g. consecutive
+    zeros, or sequences like "00", "11", "000") — these are the most common place for a
+    digit to be silently added, dropped, or duplicated. Explicitly recount the number of
+    digits in any such run before finalizing the value.
+  - Double-check the total character count of the reference number against what is visually
+    printed — do not let the value "round off" to a more familiar-looking number or pattern.
+  - If a digit is genuinely unclear (blurred, cut off, low resolution), extract your best
+    single reading of that digit rather than guessing a different digit that seems more
+    plausible — do not silently insert or drop a digit to make the number "look right" or
+    more typical.
+  - This precision requirement applies specifically to partner_po_ref and vendor_quote_ref.
+    It does not change how line item fields (Section B) are extracted.
 
 IMPORTANT — for logo/image extraction:
   - Gemini can read text embedded in images and logos natively.
@@ -77,7 +174,7 @@ OUTPUT FORMAT
 Return ONLY a valid JSON object with exactly two keys: "header" and "line_items".
 No explanation, no markdown, no backticks.
 
-The "header" object must contain ALL four keys below regardless of document type —
+The "header" object must contain ALL six keys below regardless of document type —
 set keys not applicable to this document type to null.
 
 Example output format:
@@ -85,8 +182,10 @@ Example output format:
   "header": {
     "reseller_name": "Acme Cybersolutions LLC",
     "partner_po_ref": "PO-2024-00123",
+    "partner_po_subtotal": 27000.00,
     "vendor_name": null,
-    "vendor_quote_ref": null
+    "vendor_quote_ref": null,
+    "vendor_quote_subtotal": null
   },
   "line_items": [
     {"line_num": 1, "sku": "FG-100F", "description": "FortiGate 100F Hardware", "quantity": 2, "list_unit_price": 4500.00},

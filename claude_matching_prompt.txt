@@ -150,10 +150,10 @@ Two comparisons must be performed per line item.
 
 ### Price field mapping:
 
-| Comparison | ZQ field | ZQ currency | External document | External currency |
-|---|---|---|---|---|
-| A — Sell side |  list_price  |  quote_currency  | Partner PO  unit_price  |  partner_po_currency  |
-| B — Buy side |  buy_price  |  quote_currency  | VQ  unit_price  |  vendor_quote_currency  |
+| Comparison | ZQ field | ZQ currency | External document | External currency | Currency conversion |
+|---|---|---|---|---|---|
+| A — Sell side |  list_price  |  quote_currency  | Partner PO  unit_price  |  partner_po_currency  | Required if currencies differ |
+| B — Buy side |  buy_price  |  quote_currency  | VQ  unit_price  |  vendor_quote_currency  | NOT required — always compare directly |
 
 ---
 
@@ -175,19 +175,21 @@ The ZQ list price is the reference. Convert the Partner PO price INTO  quote_cur
 •  If currencies differ → convert Partner PO price to  quote_currency  using the rates below, then compare to ZQ  list_price
 
 *Comparison B — Buy side (Buy Price vs. Vendor Quote)*
-The VQ is the reference. Convert the ZQ buy price INTO  vendor_quote_currency , then compare.
+Currency conversion is NOT performed for this comparison, under any circumstance.
+Compare  buy_price  (ZQ) directly against the VQ  unit_price  as-is, even if  quote_currency  and
+vendor_quote_currency  are different currency codes. Do not convert either value. Do not apply the
+exchange rate table below to this comparison — it applies to Comparison A only.
 
-•  If  vendor_quote_currency  =  quote_currency  → no conversion needed; compare directly
-•  If currencies differ → convert ZQ  buy_price  to  vendor_quote_currency  using the rates below, then compare to VQ  unit_price
+•  buy_price_zq_converted  is always  null  — this comparison never produces a converted value
+•  exchange_rate_used  does not apply to this comparison — leave the currency difference unaddressed and compare the raw numbers directly
 
-*Example:* ZQ buy price = AED 90, VQ currency = USD
-→ Convert: 90 ÷ 3.6725 = USD 24.51
-→ Compare USD 24.51 to VQ unit price
-→ If VQ unit price = USD 24.51 → "Price Match"
+*Example:* ZQ buy price = 90, VQ unit price = 90 → compare 90 to 90 directly → "Price Match", regardless of what  quote_currency  or  vendor_quote_currency  are set to.
 
 ---
 
 ### Step 3c — Fixed exchange rates
+
+These rates apply ONLY to Comparison A (Sell side — List Price vs. Partner PO). They are never applied to Comparison B (Buy side).
 
 | From | To | Operation |
 |------|----|-----------|
@@ -201,7 +203,7 @@ The VQ is the reference. Convert the ZQ buy price INTO  vendor_quote_currency , 
 For cross-rates not listed above (e.g. AED to SAR):
 Convert source currency → USD first, then USD → target currency.
 
-Always record:
+Always record, for Comparison A only:
 - The original price in its source currency
 - The converted price in the target currency
 - The exchange rate and operation applied
@@ -210,8 +212,8 @@ Always record:
 
 ### Step 3d — Compare and assign price status
 
-Round all converted values to 2 decimal places before comparing.
-A tolerance of ±0.50 in the comparison currency is permitted to absorb rounding differences.
+Round all values to 2 decimal places before comparing (for Comparison A, round the converted value; for Comparison B, round the raw values — no conversion applied).
+A tolerance of ±0.50 is permitted to absorb rounding differences, in the comparison currency for Comparison A and in the values as given for Comparison B.
 
 Use ONLY these exact strings for price status:
 "Price Match" | "Price Mismatch" | "Price Needs Review"
@@ -219,7 +221,7 @@ Use ONLY these exact strings for price status:
 - If prices are within ±0.50 of each other → "Price Match"
 - If prices differ by more than ±0.50 → "Price Mismatch"
 - If unit price is null or missing in any document → "Price Needs Review", note "Price missing in [document name]"
-- If currency is not one of USD, AED, SAR, QAR → "Price Needs Review", note "Unsupported currency: [currency code]"
+- If currency is not one of USD, AED, SAR, QAR → "Price Needs Review", note "Unsupported currency: [currency code]" — this rule applies to Comparison A only; Comparison B never checks currency support since it never converts
 
 ---
 
@@ -255,7 +257,7 @@ Use ONLY these exact strings for header validation status: "Match" | "Needs Revi
     "quote_currency": "currency code from ZQ",
     "partner_po_currency": "currency code from Partner PO",
     "vendor_quote_currency": "currency code from VQ",
-    "notes": "A 2 to 3 line description of what exchange rates were used for conversion and comparison with an example in case there is a conversion required, otherwise no description needed"
+    "notes": "A 2 to 3 line description of what exchange rates were used for the Sell side (List Price vs Partner PO) conversion and comparison, with an example if conversion was required. Buy side (Buy Price vs VQ) is never converted, so it needs no mention here unless the currencies happen to differ and you want to flag that no conversion was applied."
   },
   "document_header_validation": {
     "reseller": {
@@ -299,10 +301,10 @@ Use ONLY these exact strings for header validation status: "Match" | "Needs Revi
       "partner_ppo_price_converted": "partner_po_price converted to quote_currency, or null if no conversion needed",
       "list_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review",
       "buy_price_zq": "buy price from ZQ in quote_currency, or null",
-      "buy_price_zq_converted": "buy_price_zq converted to vendor_quote_currency, or null if no conversion needed",
+      "buy_price_zq_converted": "always null — Buy side comparison never converts currency",
       "vendor_quote_price": "unit price from VQ in vendor_quote_currency, or null",
-      "buy_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review",
-      "exchange_rate_used": "e.g. '1 USD = 3.6725 AED' or 'AED / 3.6725 = USD' or null if no conversion needed",
+      "buy_price_comparison_status": "Price Match|Price Mismatch|Price Needs Review — computed by comparing buy_price_zq directly to vendor_quote_price, no conversion",
+      "exchange_rate_used": "e.g. '1 USD = 3.6725 AED' or 'AED / 3.6725 = USD' for the Sell side comparison, or null if no conversion needed there — never populated for the Buy side comparison",
       "notes": "specific reason for any non-Match or non-Price Match status, or null if all match"
     }
   ],
@@ -326,7 +328,7 @@ Use ONLY these exact strings for header validation status: "Match" | "Needs Revi
 
 ## FIELD DEFINITIONS
 
-currencies_detected            — the three currency codes read from ZQ; drives all conversion logic
+currencies_detected            — the three currency codes read from ZQ; drives conversion logic for the Sell side comparison only
 document_header_validation     — comparison of ZQ reference fields against PDF-extracted header values
 matching_table                 — one row per unique consolidated SKU/product across all three documents
 unmatched_items                — items present in only one document, no equivalent found in others
@@ -335,5 +337,5 @@ must_resolve                   — any item that prevents final_call from being 
 overall_summary                — always use the exact format shown above
 final_call                     — determined mechanically by Step 4 rules only
 final_call_detail              — empty array [] if final_call is CLEAR TO PROCESS
-buy_price_zq_converted         — ZQ buy price expressed in vendor_quote_currency; this is what gets compared to VQ unit price
-partner_po_price_converted     — Partner PO price expressed in quote_currency; this is what gets compared to ZQ list price
+buy_price_zq_converted         — always null; Buy side (Buy Price vs VQ) never converts currency, ZQ buy_price is compared directly to the VQ unit price
+partner_po_price_converted     — Partner PO price expressed in quote_currency; this is what gets compared to ZQ list price (Sell side only)
