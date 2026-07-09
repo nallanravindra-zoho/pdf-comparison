@@ -427,11 +427,15 @@ def resolve_margin_by_name(raw_value, module: str, name_field: str,
 def check_margin_gate(quote: dict, token: str) -> dict:
     """
     Opportunity Gross Margin % vs Vendor Margin % check — runs first, before
-    any PDF work. 'blocked' is True only when BOTH margins resolve and
-    gross_margin < vendor_margin. Any failure — missing data, unresolvable
-    name, unexpected API error — results in the gate being SKIPPED, never
-    blocked, and is logged clearly. A margin-gate config issue must never
-    silently stall a legitimate comparison run.
+    any PDF work. Returns 'blocked': True when BOTH margins resolve and
+    gross_margin < vendor_margin — despite the field's name, this NO LONGER
+    stops the pipeline (kept as 'blocked' rather than renamed to avoid
+    touching every call site; treat it as "flagged for review" wherever it's
+    read downstream, e.g. process_quote_job maps it straight into
+    result["margin_gate"]["needs_review"]). Any failure — missing data,
+    unresolvable name, unexpected API error — results in the gate being
+    SKIPPED, logged clearly, never flagged. A margin-gate config issue must
+    never silently stall a legitimate comparison run.
 
     Also resolves amount_in_usd / net_to_vendor off the SAME Opportunity record
     fetch (see AMOUNT_IN_USD_FIELD / NET_TO_VENDOR_FIELD) — these aren't used by
@@ -913,20 +917,35 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
 
     fc_details = "".join([f"<li>{d}</li>" for d in (result.get("final_call_detail") or [])])
 
-    # ── Margin gate pass banner ──────────────────────────────
-    # Only shown when the gate actually ran and passed (result["margin_gate"]["checked"]
-    # is True). The on-hold/failed case never reaches PDF generation at all — that path
-    # short-circuits before any PDF work, per the margin gate design.
+    # ── Margin gate status banner ─────────────────────────────
+    # Shown whenever the gate actually ran ("checked" is True). Two variants:
+    # pass (green) or needs_review (amber) — the gate is non-blocking, so this
+    # PDF report always contains the full comparison regardless of which one
+    # shows here; this is purely informational, same as the widget's banner.
     mg = result.get("margin_gate") or {}
-    margin_pass_block = ""
+    margin_status_block = ""
     if mg.get("checked"):
         gm = mg.get("gross_margin")
         vm = mg.get("vendor_margin")
-        margin_pass_block = f"""<div class="margin-pass-banner">
-        <span class="mp-title">&#10003; Margin check passed</span>
-        <span class="mp-stat"><span class="mp-label">Gross Margin</span>{gm if gm is not None else '—'}%</span>
-        <span class="mp-stat"><span class="mp-label">Vendor Margin</span>{vm if vm is not None else '—'}%</span>
-      </div>"""
+        if mg.get("needs_review"):
+            margin_status_block = f"""<div class="margin-needs-review-banner">
+            <div class="mnr-title">&#9888; Margin Check — Needs Review</div>
+            <p class="mnr-detail">Gross Margin ({gm if gm is not None else '—'}%) is less than
+            Vendor Margin ({vm if vm is not None else '—'}%) — flagged for review. Document
+            comparison completed as normal.</p>
+            <div class="margin-stats-pdf">
+              <div class="ms-item"><span class="ms-label">Opportunity</span><span class="ms-value">{mg.get('opportunity_name') or '—'}</span></div>
+              <div class="ms-item"><span class="ms-label">Vendor</span><span class="ms-value">{mg.get('vendor_name') or '—'}</span></div>
+              <div class="ms-item"><span class="ms-label">Gross Margin</span><span class="ms-value" style="color:#b91c1c">{gm if gm is not None else '—'}%</span></div>
+              <div class="ms-item"><span class="ms-label">Vendor Margin</span><span class="ms-value" style="color:#065f46">{vm if vm is not None else '—'}%</span></div>
+            </div>
+          </div>"""
+        else:
+            margin_status_block = f"""<div class="margin-pass-banner">
+            <span class="mp-title">&#10003; Margin check passed</span>
+            <span class="mp-stat"><span class="mp-label">Gross Margin</span>{gm if gm is not None else '—'}%</span>
+            <span class="mp-stat"><span class="mp-label">Vendor Margin</span>{vm if vm is not None else '—'}%</span>
+          </div>"""
 
     # ── Currency overview block ──────────────────────────────
     currencies     = result.get("currencies_detected") or {}
@@ -1122,6 +1141,19 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
   .margin-pass-banner .mp-title {{ font-weight: bold; }}
   .margin-pass-banner .mp-stat {{ font-family: monospace; font-weight: 600; }}
   .margin-pass-banner .mp-label {{ font-family: Arial, Helvetica, sans-serif; font-weight: normal; color: #047857; margin-right: 3px; }}
+  .margin-needs-review-banner {{
+    background: #fef3c7; border: 1px solid #fcd34d; border-radius: 6px;
+    padding: 8px 12px; margin-bottom: 12px; color: #92400e;
+  }}
+  .margin-needs-review-banner .mnr-title {{ font-weight: bold; font-size: 10px; margin-bottom: 3px; }}
+  .margin-needs-review-banner .mnr-detail {{ font-size: 9px; color: #78350f; line-height: 1.5; margin-bottom: 6px; }}
+  .margin-stats-pdf {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+  .margin-stats-pdf .ms-item {{
+    background: rgba(255,255,255,0.6); border-radius: 5px; padding: 4px 9px;
+    display: flex; flex-direction: column; gap: 1px; min-width: 90px;
+  }}
+  .margin-stats-pdf .ms-label {{ font-size: 7px; text-transform: uppercase; letter-spacing: 0.05em; color: #78350f; font-weight: 700; }}
+  .margin-stats-pdf .ms-value {{ font-size: 10px; font-weight: 700; color: #1a1a2e; font-family: monospace; }}
 </style>
 </head>
 <body>
@@ -1129,7 +1161,7 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
     <h1>Procurement Analysis Report</h1>
     <div class="subtitle">Quote: {quote_subject} &nbsp;|&nbsp; Generated: {generated_at}{by_line}</div>
   </div>
-  {margin_pass_block}
+  {margin_status_block}
   {currency_block}
   {header_validation_block}
   <div class="banner">
@@ -1222,37 +1254,20 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
         print(f"[{job_id}] ⏱ Fetch quote: {time.time()-t0:.1f}s")
         print(f"Quote fields: {list(quote.keys())}")
 
-        quote_ref_early = quote.get("Quotation_Reference", "")
-
         # ── MARGIN GATE — first check after reading the quote, before any
-        #    PDF download/extraction/comparison. If Gross Margin % (from the
-        #    Opportunity) is less than Vendor Margin % (from the Vendor),
-        #    the quote goes straight to ON HOLD and document comparison is skipped.
+        #    PDF download/extraction/comparison. Gross Margin % (from the
+        #    Opportunity) vs Vendor Margin % (from the Vendor). NON-BLOCKING:
+        #    if Gross Margin is lower, this is surfaced as a "Needs Review"
+        #    banner (widget + PDF report) — document comparison still runs in
+        #    full underneath it. This used to short-circuit the whole job; that
+        #    behavior was intentionally removed — see result["margin_gate"]
+        #    below for how the outcome is now carried through instead.
         if is_cancelled(job_id): return
         jobs[job_id]["phase"] = "Checking vendor & opportunity margins..."
         margin = check_margin_gate(quote, token)
 
         if margin["blocked"]:
-            print(f"[{job_id}] 🚫 Margin gate BLOCKED — Gross {margin['gross_margin']}% < Vendor {margin['vendor_margin']}%")
-            jobs[job_id] = {
-                "status": "done",
-                "result": {
-                    "margin_check_failed": True,
-                    "final_call": "ON HOLD — MARGIN CHECK FAILED",
-                    "final_call_detail": [
-                        f"Gross Margin ({margin['gross_margin']}%) is less than Vendor Margin "
-                        f"({margin['vendor_margin']}%) — quote is on hold pending review. "
-                        "Document comparison was not run."
-                    ],
-                    "opportunity_name": margin["opportunity_name"],
-                    "vendor_name":      margin["vendor_name"],
-                    "gross_margin":     margin["gross_margin"],
-                    "vendor_margin":    margin["vendor_margin"],
-                },
-                "generated_at": datetime.now().isoformat(),
-                "quote_ref":    quote_ref_early,
-            }
-            return
+            print(f"[{job_id}] ⚠️  Margin gate NEEDS REVIEW — Gross {margin['gross_margin']}% < Vendor {margin['vendor_margin']}% — continuing comparison anyway")
         elif margin["skipped_reason"]:
             print(f"[{job_id}] ℹ️  Margin gate skipped ({margin['skipped_reason']}) — continuing to document comparison")
         else:
@@ -1367,12 +1382,15 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
         result = run_comparison(zoho_text, ppo_text, vq_text, job_id)
         print(f"The final result from claude is : {result}")
 
-        # Surface the margin gate outcome to the widget too, even on the pass
-        # path — lets the frontend show a small "margin check passed" banner
-        # before the normal comparison result. "checked" is False if the gate
-        # was skipped (missing data / config issue) so the widget shows nothing.
+        # Surface the margin gate outcome to the widget/PDF report. "checked" is
+        # False if the gate was skipped (missing data / config issue) so the
+        # widget shows nothing. "needs_review" is True when Gross Margin was
+        # lower than Vendor Margin — this NO LONGER stops the pipeline (see the
+        # Margin Gate block above); it's shown as a non-blocking banner instead,
+        # with the full comparison result rendered underneath it as usual.
         result["margin_gate"] = {
             "checked":          margin["skipped_reason"] is None,
+            "needs_review":     margin["blocked"],
             "opportunity_name": margin["opportunity_name"],
             "vendor_name":      margin["vendor_name"],
             "gross_margin":     margin["gross_margin"],
