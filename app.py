@@ -74,7 +74,7 @@ GROSS_MARGIN_FIELD         = "GrossMarginCalc"    # field on Deals holding Gross
 
 VENDORS_MODULE       = "Vendors"        # custom module API name
 VENDORS_NAME_FIELD   = "Name"           # field used to search Vendors by name
-VENDOR_MARGIN_FIELD  = "Vendor_Margin"  # field on Vendors holding Vendor Margin %
+VENDOR_MARGIN_FIELD  = "Min_Acceptable_Margin"  # field on Vendors holding Vendor Margin %
 
 # ─────────────────────────────────────────────
 # SUBTOTAL VALIDATION CONFIG — hardcoded, no env vars
@@ -144,7 +144,8 @@ def _sanitise_prompt(text: str) -> str:
 def _fetch_prompts_from_crm() -> tuple[str, str]:
     """Fetch GEMINI_PROMPT and CLAUDE_PROMPT from the Zoho CRM AIPrompts module.
     Returns (gemini_prompt, claude_prompt).
-    Raises RuntimeError if the module is empty or fields are blank."""
+    Raises RuntimeError if the module is empty, unreachable, or fields are blank —
+    always with Zoho's actual response detail included, never a bare status code."""
     token = get_access_token()
     url   = f"{ZOHO_BASE_URL}/crm/v3/AIPrompts"
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
@@ -152,9 +153,30 @@ def _fetch_prompts_from_crm() -> tuple[str, str]:
 
     r = requests.get(url, headers=headers, params=params, timeout=20)
     print(f"[prompts] AIPrompts CRM fetch status: {r.status_code}")
-    r.raise_for_status()
 
-    data = r.json().get("data", [])
+    if r.status_code == 204:
+        raise RuntimeError(
+            "AIPrompts module is empty — please create a record with "
+            "GEMINI_PROMPT and CLAUDE_PROMPT field values."
+        )
+
+    if not r.ok:
+        # Include Zoho's actual response body — a bare "400 Client Error" tells
+        # you nothing about WHY (wrong module name, wrong field name, no
+        # permission, etc.). This is almost always the real cause when prompts
+        # can't load, so the detail matters here more than anywhere else.
+        raise RuntimeError(
+            f"AIPrompts CRM fetch failed: {r.status_code} {r.text[:500]}"
+        )
+
+    try:
+        data = r.json().get("data", [])
+    except ValueError as e:
+        raise RuntimeError(
+            f"AIPrompts CRM fetch returned an unparseable response "
+            f"(status {r.status_code}): {r.text[:300]}"
+        ) from e
+
     if not data:
         raise RuntimeError(
             "AIPrompts module is empty — please create a record with "
@@ -195,7 +217,12 @@ def load_claude_prompt() -> str:
 
 def _refresh_prompt_cache() -> tuple[str, str]:
     """Fetch both prompts from CRM, update the cache, and return (gemini, claude).
-    Falls back to stale cache values if CRM is unreachable."""
+    Falls back to stale cache values if CRM is unreachable — but if there's no
+    cache to fall back on, the ORIGINAL specific error from _fetch_prompts_from_crm
+    (e.g. "GEMINI_PROMPT field is blank", or the actual Zoho response body) is
+    preserved in the message, not discarded in favour of a generic one. This was
+    previously the main reason prompt-loading failures showed an unhelpful error:
+    the real cause was being swallowed right here."""
     now = time.time()
     try:
         gemini_prompt, claude_prompt = _fetch_prompts_from_crm()
@@ -210,7 +237,8 @@ def _refresh_prompt_cache() -> tuple[str, str]:
             print("[prompts] Using stale cached prompts")
             return gemini_text, claude_text
         raise RuntimeError(
-            "Could not load prompts from CRM AIPrompts module and no cache available."
+            f"Could not load AI prompts from CRM AIPrompts module, and no cached "
+            f"prompts are available to fall back on. Underlying error: {e}"
         ) from e
 
 
@@ -931,20 +959,20 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
             margin_status_block = f"""<div class="margin-needs-review-banner">
             <div class="mnr-title">&#9888; Margin Check — Needs Review</div>
             <p class="mnr-detail">Gross Margin ({gm if gm is not None else '—'}%) is less than
-            Vendor Margin ({vm if vm is not None else '—'}%) — flagged for review. Document
+            Minimum Vendor Margin ({vm if vm is not None else '—'}%) — flagged for review. Document
             comparison completed as normal.</p>
             <div class="margin-stats-pdf">
               <div class="ms-item"><span class="ms-label">Opportunity</span><span class="ms-value">{mg.get('opportunity_name') or '—'}</span></div>
               <div class="ms-item"><span class="ms-label">Vendor</span><span class="ms-value">{mg.get('vendor_name') or '—'}</span></div>
               <div class="ms-item"><span class="ms-label">Gross Margin</span><span class="ms-value" style="color:#b91c1c">{gm if gm is not None else '—'}%</span></div>
-              <div class="ms-item"><span class="ms-label">Vendor Margin</span><span class="ms-value" style="color:#065f46">{vm if vm is not None else '—'}%</span></div>
+              <div class="ms-item"><span class="ms-label">Minimum Vendor Margin</span><span class="ms-value" style="color:#065f46">{vm if vm is not None else '—'}%</span></div>
             </div>
           </div>"""
         else:
             margin_status_block = f"""<div class="margin-pass-banner">
             <span class="mp-title">&#10003; Margin check passed</span>
             <span class="mp-stat"><span class="mp-label">Gross Margin</span>{gm if gm is not None else '—'}%</span>
-            <span class="mp-stat"><span class="mp-label">Vendor Margin</span>{vm if vm is not None else '—'}%</span>
+            <span class="mp-stat"><span class="mp-label">Minimum Vendor Margin</span>{vm if vm is not None else '—'}%</span>
           </div>"""
 
     # ── Currency overview block ──────────────────────────────
@@ -1012,22 +1040,104 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
 
-    table_rows = ""
-    for i, r in enumerate(result.get("matching_table", [])):
+    # Build per-SKU expanded blocks for the PDF
+    def sku_block(r, i):
         row_bg = "#ffffff" if i % 2 == 0 else "#f9fafb"
-        table_rows += f"""<tr style="background:{row_bg}">
-            <td style="text-align:center;font-weight:600">{r.get("num") or ""}</td>
-            <td style="font-family:monospace;font-size:9px;color:#374151;word-break:break-all">{r.get("sku") or ""}</td>
-            <td style="text-align:center">{r.get("ppo_qty") or "-"}</td>
-            <td style="text-align:center;font-weight:600">{r.get("zq_qty") or "-"}</td>
-            <td style="text-align:center">{status_badge(r.get("zq_status"))}</td>
-            <td style="text-align:center;font-weight:600">{r.get("vq_qty") or "-"}</td>
-            <td style="text-align:center">{status_badge(r.get("ppo_status"))}</td>
-            <td style="text-align:center">{status_badge(r.get("vq_status"))}</td>
-            <td style="text-align:center">{status_badge(r.get("list_price_comparison_status"))}</td>
-            <td style="text-align:center">{status_badge(r.get("buy_price_comparison_status"))}</td>
-            <td style="font-size:9px;color:#6b7280;line-height:1.4">{r.get("notes") or ""}</td>
-        </tr>"""
+
+        # Overall worst status
+        all_statuses = [
+            r.get("zq_status",""), r.get("vq_status",""), r.get("ppo_status",""),
+            r.get("list_price_comparison_status",""), r.get("buy_price_comparison_status","")
+        ]
+        worst = "match"
+        for s in all_statuses:
+            sl = (s or "").lower()
+            if "mismatch" in sl: worst = "mismatch"; break
+            if "review"   in sl and worst != "mismatch": worst = "review"
+        if worst == "mismatch": pill_bg, pill_cl, pill_lbl = "#fee2e2","#991b1b","Mismatch"
+        elif worst == "review": pill_bg, pill_cl, pill_lbl = "#fef3c7","#92400e","Review"
+        else:                   pill_bg, pill_cl, pill_lbl = "#d1fae5","#065f46","Match"
+        overall_pill = f'<span class="pill" style="background:{pill_bg};color:{pill_cl}">{pill_lbl}</span>'
+
+        zq_qty  = r.get("zq_qty")  or "-"
+        vq_qty  = r.get("vq_qty")  or "-"
+        ppo_qty = r.get("ppo_qty") or "-"
+
+        # Qty row — single Match if all qty statuses are clean Match
+        all_qty_match = all(
+            ("match" in (r.get(f) or "").lower() and "mismatch" not in (r.get(f) or "").lower())
+            for f in ["zq_status","vq_status","ppo_status"]
+        )
+        if all_qty_match:
+            qty_row = f"""<tr>
+              <td class="rl">Qty</td>
+              <td class="cv">{zq_qty}</td>
+              <td class="cv">{ppo_qty}</td>
+              <td class="cv">{vq_qty}</td>
+              <td class="sc">{status_badge("Match")}</td>
+            </tr>"""
+        else:
+            qty_row = f"""<tr>
+              <td class="rl">Qty</td>
+              <td class="cv">{zq_qty}</td>
+              <td class="cv">{ppo_qty}</td>
+              <td class="cv">{vq_qty}</td>
+              <td class="sc">
+                <div style="font-size:7px;color:#6b7280">ZQ↔PPO {status_badge(r.get("zq_status"))}</div>
+                <div style="font-size:7px;color:#6b7280">ZQ↔VQ&nbsp;&nbsp;{status_badge(r.get("vq_status"))}</div>
+                <div style="font-size:7px;color:#6b7280">PPO↔VQ {status_badge(r.get("ppo_status"))}</div>
+              </td>
+            </tr>"""
+
+        note = (r.get("notes") or "").strip()
+        note_row = f"""<tr>
+          <td class="rl">Notes</td>
+          <td colspan="4" style="font-size:8px;color:#6b7280;line-height:1.4">{note}</td>
+        </tr>""" if note else ""
+
+        return f"""<div class="sku-block" style="background:{row_bg}">
+          <div class="sku-hdr">
+            <span class="sku-num">{r.get("num") or i+1}</span>
+            <span class="sku-code">{r.get("sku") or "—"}</span>
+            <span style="margin-left:auto">{overall_pill}</span>
+          </div>
+          <table class="dt">
+            <thead>
+              <tr>
+                <th style="width:65px"></th>
+                <th>ZQ</th><th>PPO</th><th>VQ</th>
+                <th style="width:110px;text-align:center">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {qty_row}
+              <tr style="background:#f8f8f8">
+                <td class="rl">Price</td>
+                <td class="cv" style="font-size:7px;color:#9ca3af;font-weight:600">ZQ</td>
+                <td class="cv" style="font-size:7px;color:#9ca3af;font-weight:600">PPO</td>
+                <td class="cv" style="font-size:7px;color:#9ca3af;font-weight:600">VQ</td>
+                <td></td>
+              </tr>
+              <tr style="background:#f8f8f8">
+                <td class="rl sub">List&nbsp;Price</td>
+                <td class="cv">{r.get("list_price_zq") or "-"}</td>
+                <td class="cv">{r.get("partner_ppo_price_original") or "-"}</td>
+                <td class="cv" style="color:#d1d5db">—</td>
+                <td class="sc">{status_badge(r.get("list_price_comparison_status"))}</td>
+              </tr>
+              <tr style="background:#f8f8f8">
+                <td class="rl sub">Buy&nbsp;Price</td>
+                <td class="cv">{r.get("buy_price_zq") or "-"}</td>
+                <td class="cv" style="color:#d1d5db">—</td>
+                <td class="cv">{r.get("vendor_quote_price") or "-"}</td>
+                <td class="sc">{status_badge(r.get("buy_price_comparison_status"))}</td>
+              </tr>
+              {note_row}
+            </tbody>
+          </table>
+        </div>"""
+
+    sku_blocks = "".join(sku_block(r, i) for i, r in enumerate(result.get("matching_table", [])))
 
     if job_id and is_cancelled(job_id):
         raise Exception("Job cancelled by user")
@@ -1117,6 +1227,20 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
   .pill-review {{ background: #fef3c7; color: #92400e; }}
   .pill-miss   {{ background: #fee2e2; color: #991b1b; }}
   .pill-na     {{ background: #f3f4f6; color: #9ca3af; }}
+  /* ── SKU accordion blocks (PDF) ── */
+  .sku-block  {{ border: 1px solid #e5e7eb; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
+  .sku-hdr    {{ display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+                 background: #1a1a2e; color: #fff; }}
+  .sku-num    {{ font-size: 8px; color: #9ca3af; min-width: 14px; }}
+  .sku-code   {{ font-family: monospace; font-size: 9px; font-weight: 700; color: #fff; }}
+  .dt         {{ width: 100%; border-collapse: collapse; font-size: 8px; }}
+  .dt thead th {{ background: #374151; color: #fff; padding: 4px 6px; text-align: left;
+                  font-size: 7px; font-weight: 600; text-transform: uppercase; }}
+  .dt tbody td {{ padding: 4px 6px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }}
+  .dt .rl     {{ font-weight: 700; color: #374151; font-size: 8px; white-space: nowrap; }}
+  .dt .rl.sub {{ font-weight: 400; color: #6b7280; padding-left: 14px; font-size: 7px; }}
+  .dt .cv     {{ font-family: monospace; font-size: 8px; color: #1a1a2e; }}
+  .dt .sc     {{ text-align: left; }}
   .summary-label {{ font-weight: bold; font-size: 9px; margin: 7px 0 3px 0; }}
   .label-red   {{ color: #ef4444; }}
   .label-amber {{ color: #f59e0b; }}
@@ -1169,23 +1293,7 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
   </div>
   <div class="card">
     <div class="card-title">Section 1 - Three-Way Item Matching</div>
-    <table>
-      <thead>
-        <tr>
-          <th>#</th><th>ZQ SKU</th>
-          <th style="text-align:center">PPO Qty</th>
-          <th style="text-align:center">ZQ Qty</th>
-          <th style="text-align:center">ZQ&#8596;PPO</th>
-          <th style="text-align:center">VQ Qty</th>
-          <th style="text-align:center">ZQ&#8596;VQ</th>
-          <th style="text-align:center">PPO&#8596;VQ</th>
-          <th style="text-align:center">ZQ-PPO Price</th>
-          <th style="text-align:center">ZQ-VQ Price</th>
-          <th>Notes</th>
-        </tr>
-      </thead>
-      <tbody>{table_rows}</tbody>
-    </table>
+    {sku_blocks}
   </div>
   {subtotal_validation_block}
   <div class="card">
@@ -1247,6 +1355,22 @@ def process_quote_job(job_id: str, quote_id: str, initiated_by: str = ""):
         if is_cancelled(job_id): return
         token = get_access_token()
         print(f"[{job_id}] ⏱ Auth: {time.time()-t0:.1f}s")
+
+        # ── VALIDATE AI PROMPTS ARE LOADABLE — before any other work. This is
+        #    deliberately the very first real step: previously prompts were only
+        #    loaded deep into the job (Gemini prompt just before extraction,
+        #    Claude prompt inside run_comparison), so a broken AIPrompts CRM
+        #    record failed only after the margin gate AND both PDF downloads had
+        #    already run — slow to fail, and the underlying error message was
+        #    also being swallowed by _refresh_prompt_cache's fallback (fixed
+        #    separately). Failing here means it fails fast, cheap, and with the
+        #    real cause. This also warms the 5-min cache so the later calls to
+        #    load_gemini_prompt()/load_claude_prompt() are free (no extra CRM hit).
+        #    No dedicated phase shown for this — runs silently under "Initialising...".
+        load_gemini_prompt()
+        load_claude_prompt()
+        print(f"[{job_id}] ⏱ Prompts verified: {time.time()-t0:.1f}s")
+
         jobs[job_id]["phase"] = "Fetching quote from Zoho..."
 
         if is_cancelled(job_id): return

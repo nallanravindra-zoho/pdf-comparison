@@ -730,13 +730,13 @@ function marginNeedsReviewBanner(mg) {
     + '<div class="mnr-row">'
     + '<span class="mnr-title">&#9888; Margin Check &#8212; Needs Review</span>'
     + '<span class="mnr-detail">Gross Margin (' + (gm !== null && gm !== undefined ? gm + '%' : '—')
-    + ') is less than Vendor Margin (' + (vm !== null && vm !== undefined ? vm + '%' : '—') + ')</span>'
+    + ') is less than Minimum Vendor Margin (' + (vm !== null && vm !== undefined ? vm + '%' : '—') + ')</span>'
     + '</div>'
     + '<div class="margin-stats" style="margin-top:10px">'
     + marginStat("Opportunity", mg.opportunity_name, null)
     + marginStat("Vendor", mg.vendor_name, null)
     + marginStat("Gross Margin %", (gm !== null && gm !== undefined) ? gm + '%' : null, "bad")
-    + marginStat("Vendor Margin %", (vm !== null && vm !== undefined) ? vm + '%' : null, "good")
+    + marginStat("Minimum Vendor Margin %", (vm !== null && vm !== undefined) ? vm + '%' : null, "good")
     + '</div>'
     + '</div>';
 }
@@ -749,7 +749,7 @@ function marginPassBanner(mg) {
   return '<div class="margin-pass-banner">'
     + '<span class="mp-title">&#9989; Margin check passed</span>'
     + '<span class="mp-stat"><span class="mp-label">Gross Margin</span>' + (gm !== null && gm !== undefined ? gm + '%' : '—') + '</span>'
-    + '<span class="mp-stat"><span class="mp-label">Vendor Margin</span>' + (vm !== null && vm !== undefined ? vm + '%' : '—') + '</span>'
+    + '<span class="mp-stat"><span class="mp-label">Minimum Vendor Margin</span>' + (vm !== null && vm !== undefined ? vm + '%' : '—') + '</span>'
     + '</div>';
 }
 
