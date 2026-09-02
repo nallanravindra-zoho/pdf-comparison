@@ -712,8 +712,13 @@ def format_zoho_quote(quote: dict) -> str:
         sku          = product_name_field.get("Product_Code") or product_name_field.get("name") or "N/A"
         desc         = item.get("Description", "N/A")
         qty          = item.get("Quantity", "N/A")
-        buy_price_zq = item.get("Buy_Price", "N/A")
-        list_price_zq= item.get("List_Price", "N/A")
+
+        # Round to 2dp — Zoho API returns full-precision floats for multi-currency
+        # quotes (e.g. AED/3.6725 = 8844.086021505) even though the UI shows 8844.09
+        raw_buy  = item.get("Buy_Price")
+        raw_list = item.get("List_Price")
+        buy_price_zq  = round(raw_buy,  2) if isinstance(raw_buy,  (int, float)) else (raw_buy  or "N/A")
+        list_price_zq = round(raw_list, 2) if isinstance(raw_list, (int, float)) else (raw_list or "N/A")
 
         lines.append(f"  {i}. SKU          : {sku}")
         lines.append(f"     Description  : {desc}")
@@ -1059,9 +1064,9 @@ def generate_pdf_report(result: dict, quote_subject: str, job_id: str = None, in
         else:                   pill_bg, pill_cl, pill_lbl = "#d1fae5","#065f46","Match"
         overall_pill = f'<span class="pill" style="background:{pill_bg};color:{pill_cl}">{pill_lbl}</span>'
 
-        zq_qty  = r.get("zq_qty")  or "-"
-        vq_qty  = r.get("vq_qty")  or "-"
-        ppo_qty = r.get("ppo_qty") or "-"
+        zq_qty  = str(r.get("zq_qty"))  if r.get("zq_qty")  is not None else "-"
+        vq_qty  = str(r.get("vq_qty"))  if r.get("vq_qty")  is not None else "-"
+        ppo_qty = str(r.get("ppo_qty")) if r.get("ppo_qty") is not None else "-"
 
         # Qty row — single Match if all qty statuses are clean Match
         all_qty_match = all(
